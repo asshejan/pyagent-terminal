@@ -1,0 +1,680 @@
+=== ma-01 | The supervisor pattern | 4
+::: story
+One LLM-powered SUPERVISOR decides which specialist WORKER acts next; each
+worker reports back to the supervisor; the supervisor says FINISH when done.
+```
+              +------------+
+  START ----> | supervisor | --FINISH--> END
+              +------------+
+               ^   |   ^   |
+               |   v   |   v
+            researcher  coder
+```
+::: setup fake_llm mini_graph
+::: task
+Write `build_supervisor(llm, workers, max_turns=4)` where `workers` is a dict
+name -> function `fn(state) -> str`. State `TeamState`: `task: str`,
+`messages: Annotated[list, operator.add]`, `next: str`, `turns: int`.
+- `supervisor` node: if `turns` (missing = 0) >= max_turns, next = "FINISH".
+  Otherwise ask the llm with this exact prompt:
+      Task: <task>
+      Workers: <names joined by ", ">
+      History:
+      <one line per message: "<name>: <content>">
+      Who acts next? Reply with a worker name or FINISH.
+  Strip the reply; anything that isn't a worker name becomes "FINISH".
+- one node per worker: returns
+  `{"messages": [{"name": <worker>, "content": fn(state)}], "turns": turns + 1}`
+- edges: START -> supervisor; supervisor -> (next) -> worker or END;
+  every worker -> supervisor.
+Beware Python's late-binding closures when creating nodes in a loop!
+::: starter
+import operator
+from typing import Annotated, TypedDict
+
+class TeamState(TypedDict):
+    task: str
+    messages: Annotated[list, operator.add]
+    next: str
+    turns: int
+
+def build_supervisor(llm, workers, max_turns=4):
+    pass
+::: solution
+import operator
+from typing import Annotated, TypedDict
+
+class TeamState(TypedDict):
+    task: str
+    messages: Annotated[list, operator.add]
+    next: str
+    turns: int
+
+def build_supervisor(llm, workers, max_turns=4):
+    names = list(workers)
+
+    def supervisor(state):
+        if state.get("turns", 0) >= max_turns:
+            return {"next": "FINISH"}
+        history = "\n".join(f"{m['name']}: {m['content']}" for m in state.get("messages", []))
+        prompt = (
+            f"Task: {state['task']}\n"
+            f"Workers: {', '.join(names)}\n"
+            f"History:\n{history}\n"
+            "Who acts next? Reply with a worker name or FINISH."
+        )
+        choice = llm.invoke(prompt).strip()
+        return {"next": choice if choice in workers else "FINISH"}
+
+    def make_worker(name, fn):
+        def node(state):
+            return {"messages": [{"name": name, "content": fn(state)}], "turns": state.get("turns", 0) + 1}
+        return node
+
+    graph = StateGraph(TeamState)
+    graph.add_node("supervisor", supervisor)
+    for name, fn in workers.items():
+        graph.add_node(name, make_worker(name, fn))
+        graph.add_edge(name, "supervisor")
+    graph.add_edge(START, "supervisor")
+    graph.add_conditional_edges("supervisor", lambda s: s["next"], {**{n: n for n in names}, "FINISH": END})
+    return graph.compile()
+::: hint
+A helper `make_worker(name, fn)` that returns a node function captures the right name for each worker. A lambda inside the loop would see only the LAST name.
+::: hint
+Path map: `{**{n: n for n in names}, "FINISH": END}`.
+::: test routes through workers
+llm = FakeLLM(responses=["researcher", "coder", "FINISH"])
+workers = {"researcher": lambda s: "found docs", "coder": lambda s: "wrote code"}
+out = build_supervisor(llm, workers).invoke({"task": "build a scraper"})
+assert out["messages"] == [{"name": "researcher", "content": "found docs"}, {"name": "coder", "content": "wrote code"}]
+assert out["next"] == "FINISH"
+::: test prompt format
+llm = FakeLLM(responses=["researcher", "FINISH"])
+build_supervisor(llm, {"researcher": lambda s: "x", "coder": lambda s: "y"}).invoke({"task": "T"})
+assert llm.calls[0] == "Task: T\nWorkers: researcher, coder\nHistory:\n\nWho acts next? Reply with a worker name or FINISH."
+assert "researcher: x" in llm.calls[1]
+::: test unknown choice finishes
+llm = FakeLLM(responses=["the moon"])
+out = build_supervisor(llm, {"a": lambda s: "x"}).invoke({"task": "?"})
+assert out.get("messages", []) == [] and out["next"] == "FINISH"
+::: test max turns guard
+llm = FakeLLM(default="a")
+out = build_supervisor(llm, {"a": lambda s: "again"}, max_turns=3).invoke({"task": "loop"})
+assert out["turns"] == 3 and len(out["messages"]) == 3
+::: realworld
+    # langgraph-supervisor package:
+    from langgraph_supervisor import create_supervisor
+    app = create_supervisor([research_agent, code_agent], model=llm).compile()
+
+=== ma-02 | Handoffs with Command | 4
+::: story
+Instead of a central router, agents can HAND OFF directly. A node returns a
+`Command` that both updates state and names the next node:
+```
+return Command(update={"replies": ["..."]}, goto="billing")
+```
+No conditional edges needed — the graph only needs an entry edge.
+::: setup mini_graph
+::: task
+Build a help desk with three agents over `DeskState`: `request: str`,
+`replies: Annotated[list, operator.add]`, `handoffs: Annotated[list, operator.add]`.
+- `triage`: if the request (lowercased) mentions "refund" or "invoice" ->
+  go to `billing`; else if it mentions "error" or "crash" -> go to `tech`;
+  else reply `"triage: how can I help?"` and go to END. Each handoff is logged
+  as `"triage->billing"` / `"triage->tech"` in `handoffs`.
+- `tech`: replies `"tech: restart the app"`; if the request ALSO mentions
+  "refund", hand off to billing (log `"tech->billing"`), else END.
+- `billing`: replies `"billing: refund issued"` and goes to END.
+`build_helpdesk()` returns the compiled graph (only edge: START -> triage).
+::: starter
+import operator
+from typing import Annotated, TypedDict
+
+class DeskState(TypedDict):
+    request: str
+    replies: Annotated[list, operator.add]
+    handoffs: Annotated[list, operator.add]
+
+def triage(state):
+    pass
+
+def tech(state):
+    pass
+
+def billing(state):
+    pass
+
+def build_helpdesk():
+    pass
+::: solution
+import operator
+from typing import Annotated, TypedDict
+
+class DeskState(TypedDict):
+    request: str
+    replies: Annotated[list, operator.add]
+    handoffs: Annotated[list, operator.add]
+
+def triage(state):
+    text = state["request"].lower()
+    if "refund" in text or "invoice" in text:
+        return Command(update={"handoffs": ["triage->billing"]}, goto="billing")
+    if "error" in text or "crash" in text:
+        return Command(update={"handoffs": ["triage->tech"]}, goto="tech")
+    return Command(update={"replies": ["triage: how can I help?"]}, goto=END)
+
+def tech(state):
+    update = {"replies": ["tech: restart the app"]}
+    if "refund" in state["request"].lower():
+        return Command(update={**update, "handoffs": ["tech->billing"]}, goto="billing")
+    return Command(update=update, goto=END)
+
+def billing(state):
+    return Command(update={"replies": ["billing: refund issued"]}, goto=END)
+
+def build_helpdesk():
+    graph = StateGraph(DeskState)
+    graph.add_node("triage", triage)
+    graph.add_node("tech", tech)
+    graph.add_node("billing", billing)
+    graph.add_edge(START, "triage")
+    return graph.compile()
+::: hint
+`Command(update={...}, goto="billing")` — `goto=END` finishes the run.
+::: hint
+Since the reducers are `operator.add`, updates must be LISTS: `{"handoffs": ["triage->tech"]}`.
+::: test billing route
+out = build_helpdesk().invoke({"request": "Where is my INVOICE?"})
+assert out["replies"] == ["billing: refund issued"] and out["handoffs"] == ["triage->billing"]
+::: test tech then billing
+out = build_helpdesk().invoke({"request": "app crash, I want a refund"})
+assert out["handoffs"] == ["triage->billing"], "refund takes priority in triage"
+out = build_helpdesk().invoke({"request": "error on login"})
+assert out["replies"] == ["tech: restart the app"] and out["handoffs"] == ["triage->tech"]
+::: test tech hands off
+out = tech({"request": "error and refund please"})
+assert out.goto == "billing" and out.update["handoffs"] == ["tech->billing"]
+::: test general request
+out = build_helpdesk().invoke({"request": "hello"})
+assert out["replies"] == ["triage: how can I help?"] and out.get("handoffs", []) == []
+
+=== ma-03 | Subgraphs: private agent state | 4
+::: story
+Each agent can be its own graph with PRIVATE scratch state (notes, tool
+results) — the team only sees its final output. That keeps the shared
+context small and focused. A compiled graph is just a callable, so a parent
+node can `invoke` a child graph.
+::: setup mini_graph
+FACTS = {
+    "rag": ["RAG retrieves documents", "RAG grounds answers"],
+    "agents": ["Agents call tools", "Agents loop until done"],
+}
+
+def search(question):
+    return FACTS.get(question.lower(), ["no facts found"])
+::: task
+1. `build_researcher()` -> compiled subgraph over `ResearchState`
+   (`question`, `notes: Annotated[list, operator.add]`, `summary`):
+   `search_node` adds `search(question)` results to notes; `summarize_node`
+   sets summary = notes joined by `"; "`. START -> search_node -> summarize_node -> END.
+2. `build_team()` -> compiled parent graph over `TeamState`
+   (`question`, `messages: Annotated[list, operator.add]`):
+   - `researcher` node: invokes the subgraph with `{"question": ...}` and
+     returns only `{"messages": [{"name": "researcher", "content": summary}]}`
+   - `writer` node: `{"messages": [{"name": "writer", "content": "Report: " + <researcher's content>}]}`
+   START -> researcher -> writer -> END.
+Build the subgraph ONCE (in build_team), not on every call.
+::: starter
+import operator
+from typing import Annotated, TypedDict
+
+class ResearchState(TypedDict):
+    question: str
+    notes: Annotated[list, operator.add]
+    summary: str
+
+class TeamState(TypedDict):
+    question: str
+    messages: Annotated[list, operator.add]
+
+def build_researcher():
+    pass
+
+def build_team():
+    pass
+::: solution
+import operator
+from typing import Annotated, TypedDict
+
+class ResearchState(TypedDict):
+    question: str
+    notes: Annotated[list, operator.add]
+    summary: str
+
+class TeamState(TypedDict):
+    question: str
+    messages: Annotated[list, operator.add]
+
+def build_researcher():
+    def search_node(state):
+        return {"notes": search(state["question"])}
+
+    def summarize_node(state):
+        return {"summary": "; ".join(state["notes"])}
+
+    g = StateGraph(ResearchState)
+    g.add_node("search_node", search_node)
+    g.add_node("summarize_node", summarize_node)
+    g.add_edge(START, "search_node")
+    g.add_edge("search_node", "summarize_node")
+    g.add_edge("summarize_node", END)
+    return g.compile()
+
+def build_team():
+    researcher_graph = build_researcher()
+
+    def researcher(state):
+        result = researcher_graph.invoke({"question": state["question"]})
+        return {"messages": [{"name": "researcher", "content": result["summary"]}]}
+
+    def writer(state):
+        research = next(m["content"] for m in state["messages"] if m["name"] == "researcher")
+        return {"messages": [{"name": "writer", "content": "Report: " + research}]}
+
+    g = StateGraph(TeamState)
+    g.add_node("researcher", researcher)
+    g.add_node("writer", writer)
+    g.add_edge(START, "researcher")
+    g.add_edge("researcher", "writer")
+    g.add_edge("writer", END)
+    return g.compile()
+::: hint
+The parent node returns ONLY the summary — the subgraph's notes never leak into the parent state.
+::: hint
+Compile the researcher in `build_team` and capture it in the `researcher` node's closure.
+::: test subgraph alone
+out = build_researcher().invoke({"question": "RAG"})
+assert out["notes"] == ["RAG retrieves documents", "RAG grounds answers"]
+assert out["summary"] == "RAG retrieves documents; RAG grounds answers"
+::: test team output
+out = build_team().invoke({"question": "agents"})
+assert out["messages"] == [
+    {"name": "researcher", "content": "Agents call tools; Agents loop until done"},
+    {"name": "writer", "content": "Report: Agents call tools; Agents loop until done"},
+]
+::: test private state does not leak
+out = build_team().invoke({"question": "rag"})
+assert set(out) == {"question", "messages"}, f"parent state leaked keys: {set(out)}"
+::: test subgraph built once
+calls = []
+_orig = build_researcher
+def counting():
+    calls.append(1)
+    return _orig()
+build_team.__globals__["build_researcher"] = counting
+app = build_team()
+app.invoke({"question": "rag"}); app.invoke({"question": "agents"})
+build_team.__globals__["build_researcher"] = _orig
+assert len(calls) == 1, "compile the subgraph once in build_team"
+
+=== ma-04 | Planner, executor, critic | 5
+::: story
+A robust agent team for multi-step goals:
+- PLANNER asks the LLM for a numbered plan
+- EXECUTOR runs the steps one at a time (looping on itself)
+- CRITIC checks the results; on failure it can send the team back to the
+  planner (with the failures as feedback) — but only a limited number of times
+`run_step(step)` is provided: it returns `"did <step>"`, or raises if the
+step contains "impossible".
+::: setup fake_llm mini_graph
+def run_step(step):
+    if "impossible" in step.lower():
+        raise RuntimeError(f"cannot {step}")
+    return f"did {step}"
+::: task
+1. `parse_plan(text)` -> list of steps from lines like `"1. foo"`, `"2) bar"`,
+   `"- baz"` (strip the numbering/bullets; skip blank lines).
+2. `build_pec(llm, max_replans=1)` -> compiled graph over `PECState`
+   (`goal`, `plan`, `step`, `results`, `verdict`, `replans`), all plain
+   (overwrite) keys:
+   - `planner`: prompt `"Plan steps for: <goal>"`, plus
+     `"\nPrevious attempt failed: <failed results joined by '; '>"` if any
+     current results start with "FAILED". Returns the parsed plan, `step=0`,
+     `results=[]`, and `replans` (missing = 0) incremented by 1 ONLY if a plan
+     already existed.
+   - `executor`: runs `run_step(plan[step])`; an exception becomes the result
+     `"FAILED: <message>"`. Appends to results, increments step.
+   - after executor: back to `executor` while steps remain, else `critic`.
+   - `critic`: verdict `"replan"` if any result failed and
+     `replans < max_replans`; else `"accept"` if nothing failed, else `"give_up"`.
+   - after critic: `planner` on "replan", otherwise END.
+::: starter
+import re
+from typing import TypedDict
+
+class PECState(TypedDict):
+    goal: str
+    plan: list
+    step: int
+    results: list
+    verdict: str
+    replans: int
+
+def parse_plan(text):
+    pass
+
+def build_pec(llm, max_replans=1):
+    pass
+::: solution
+import re
+from typing import TypedDict
+
+class PECState(TypedDict):
+    goal: str
+    plan: list
+    step: int
+    results: list
+    verdict: str
+    replans: int
+
+def parse_plan(text):
+    steps = []
+    for line in text.splitlines():
+        line = re.sub(r"^\s*(?:\d+[.)]|[-*])\s*", "", line).strip()
+        if line:
+            steps.append(line)
+    return steps
+
+def _failed(state):
+    return [r for r in state.get("results", []) if r.startswith("FAILED")]
+
+def build_pec(llm, max_replans=1):
+    def planner(state):
+        prompt = f"Plan steps for: {state['goal']}"
+        failed = _failed(state)
+        if failed:
+            prompt += f"\nPrevious attempt failed: {'; '.join(failed)}"
+        replans = state.get("replans", 0) + (1 if "plan" in state else 0)
+        return {"plan": parse_plan(llm.invoke(prompt)), "step": 0, "results": [], "replans": replans}
+
+    def executor(state):
+        step_text = state["plan"][state["step"]]
+        try:
+            result = run_step(step_text)
+        except Exception as exc:
+            result = f"FAILED: {exc}"
+        return {"results": state["results"] + [result], "step": state["step"] + 1}
+
+    def critic(state):
+        failed = _failed(state)
+        if failed and state["replans"] < max_replans:
+            return {"verdict": "replan"}
+        return {"verdict": "give_up" if failed else "accept"}
+
+    g = StateGraph(PECState)
+    g.add_node("planner", planner)
+    g.add_node("executor", executor)
+    g.add_node("critic", critic)
+    g.add_edge(START, "planner")
+    g.add_edge("planner", "executor")
+    g.add_conditional_edges("executor", lambda s: "executor" if s["step"] < len(s["plan"]) else "critic")
+    g.add_conditional_edges("critic", lambda s: "planner" if s["verdict"] == "replan" else END)
+    return g.compile()
+::: hint
+`re.sub(r"^\s*(?:\d+[.)]|[-*])\s*", "", line)` strips "1." "2)" "-" "*".
+::: hint
+A router can return node names directly without a path map: `lambda s: "executor" if s["step"] < len(s["plan"]) else "critic"`.
+::: test parse plan
+assert parse_plan("1. search\n2) read\n\n- write it\n* send") == ["search", "read", "write it", "send"]
+::: test happy path
+llm = FakeLLM(responses=["1. search web\n2. write summary"])
+out = build_pec(llm).invoke({"goal": "report"})
+assert out["results"] == ["did search web", "did write summary"]
+assert out["verdict"] == "accept" and out["replans"] == 0
+assert llm.calls == ["Plan steps for: report"]
+::: test replans after failure
+llm = FakeLLM(responses=["1. impossible jump\n2. land", "1. walk\n2. land"])
+out = build_pec(llm).invoke({"goal": "cross river"})
+assert llm.calls[1] == "Plan steps for: cross river\nPrevious attempt failed: FAILED: cannot impossible jump"
+assert out["results"] == ["did walk", "did land"] and out["verdict"] == "accept" and out["replans"] == 1
+::: test gives up
+llm = FakeLLM(default="1. impossible task")
+out = build_pec(llm, max_replans=2).invoke({"goal": "x"})
+assert out["verdict"] == "give_up" and out["replans"] == 2 and len(llm.calls) == 3
+
+=== ma-05 | Map-reduce with Send | 4
+::: story
+Fan out work to many parallel agent runs, then combine. A router can return
+a list of `Send(node, arg)` — each one runs `node` with its OWN input (not the
+whole state). Results merge back through a reducer, and the next node runs
+once all branches finish.
+```
+def fan_out(state):
+    return [Send("summarize", {"topic": t}) for t in state["topics"]]
+graph.add_conditional_edges(START, fan_out)
+```
+::: setup fake_llm mini_graph
+::: task
+Write `build_map_reduce(llm)` over `MRState`:
+`topics: list`, `summaries: Annotated[list, operator.add]`, `final: str`.
+- router from START: one `Send("summarize", {"topic": t})` per topic; if there
+  are no topics, route straight to `"reduce"`.
+- `summarize(arg)`: `text = llm.invoke("Summarize " + arg["topic"])`, returns
+  `{"summaries": [f"{topic}: {text}"]}`
+- `summarize -> reduce`
+- `reduce`: `final` = sorted summaries joined by newlines, or
+  `"(nothing to summarize)"` if there are none.
+::: starter
+import operator
+from typing import Annotated, TypedDict
+
+class MRState(TypedDict):
+    topics: list
+    summaries: Annotated[list, operator.add]
+    final: str
+
+def build_map_reduce(llm):
+    pass
+::: solution
+import operator
+from typing import Annotated, TypedDict
+
+class MRState(TypedDict):
+    topics: list
+    summaries: Annotated[list, operator.add]
+    final: str
+
+def build_map_reduce(llm):
+    def fan_out(state):
+        topics = state.get("topics", [])
+        if not topics:
+            return "reduce"
+        return [Send("summarize", {"topic": t}) for t in topics]
+
+    def summarize(arg):
+        text = llm.invoke("Summarize " + arg["topic"])
+        return {"summaries": [f"{arg['topic']}: {text}"]}
+
+    def reduce(state):
+        items = sorted(state.get("summaries", []))
+        return {"final": "\n".join(items) if items else "(nothing to summarize)"}
+
+    g = StateGraph(MRState)
+    g.add_node("summarize", summarize)
+    g.add_node("reduce", reduce)
+    g.add_conditional_edges(START, fan_out)
+    g.add_edge("summarize", "reduce")
+    g.add_edge("reduce", END)
+    return g.compile()
+::: hint
+`summarize` receives the Send's arg dict, NOT the graph state.
+::: hint
+A router may return a single node name (`"reduce"`) or a list of Send objects.
+::: test fan out and reduce
+llm = FakeLLM(rules={"rag": "retrieval", "agents": "tool loops", "graphs": "nodes+edges"})
+app = build_map_reduce(llm)
+out = app.invoke({"topics": ["rag", "agents", "graphs"]})
+assert sorted(llm.calls) == ["Summarize agents", "Summarize graphs", "Summarize rag"]
+assert out["final"] == "agents: tool loops\ngraphs: nodes+edges\nrag: retrieval"
+::: test reduce runs once
+llm = FakeLLM(default="x")
+names = [n for e in build_map_reduce(llm).stream({"topics": ["a", "b"]}) for n in e]
+assert names.count("summarize") == 2 and names.count("reduce") == 1, names
+::: test empty
+out = build_map_reduce(FakeLLM()).invoke({"topics": []})
+assert out["final"] == "(nothing to summarize)"
+
+=== ma-06 | Capstone: a research team | 5
+::: story
+Put it all together: a team that researches a topic, writes a report with
+sources, and revises it until a reviewer approves.
+```
+supervisor --> researcher (search tool)
+     ^     --> writer (LLM)    <-- feedback --+
+     |     --> reviewer (LLM) -- APPROVE / REVISE: ...
+     +--- every worker reports back
+```
+The supervisor here is RULE-based (cheap and predictable); the workers use
+the LLM. `search(topic)` is provided and returns `[{"title", "url"}, ...]`.
+::: setup fake_llm mini_graph
+SEARCH_DB = {
+    "langgraph": [
+        {"title": "LangGraph docs", "url": "https://langchain-ai.github.io/langgraph"},
+        {"title": "Multi-agent guide", "url": "https://example.com/multi-agent"},
+    ],
+}
+
+def search(topic):
+    return SEARCH_DB.get(topic.lower(), [{"title": f"Wiki: {topic}", "url": f"https://wiki.example/{topic}"}])
+::: task
+Write `run_research(llm, topic, max_revisions=2)` that builds and runs a graph
+over `ResearchState` and returns
+`{"report": draft, "approved": bool, "revisions": int, "log": [...]}`.
+State keys: `topic`, `sources`, `draft`, `feedback`, `revisions`, `reviewed`,
+`approved`, `next`, and `log: Annotated[list, operator.add]` (others overwrite).
+- `supervisor` sets `next`: no sources -> "researcher"; no draft -> "writer";
+  draft not yet reviewed -> "reviewer"; approved -> "FINISH"; revisions <
+  max_revisions -> "writer"; else "FINISH".
+- `researcher`: `sources = search(topic)`.
+- `writer`: prompt `"Write about <topic> using: <titles joined by ', '>"` plus
+  `"\nAddress feedback: <feedback>"` when there is feedback. The draft is the
+  LLM reply + `"\n\nSources:\n"` + one `"- <title> (<url>)"` line per source.
+  Increments revisions, sets `reviewed=False`.
+- `reviewer`: `reply = llm.invoke("Review this draft:\n" + draft)`. If it starts
+  with "APPROVE": approved=True. If it starts with "REVISE:", feedback = the
+  text after the colon, stripped. Sets `reviewed=True`.
+- every worker logs its own name in `log` and returns to the supervisor.
+::: starter
+import operator
+from typing import Annotated, TypedDict
+
+class ResearchState(TypedDict):
+    topic: str
+    sources: list
+    draft: str
+    feedback: str
+    revisions: int
+    reviewed: bool
+    approved: bool
+    next: str
+    log: Annotated[list, operator.add]
+
+def run_research(llm, topic, max_revisions=2):
+    pass
+::: solution
+import operator
+from typing import Annotated, TypedDict
+
+class ResearchState(TypedDict):
+    topic: str
+    sources: list
+    draft: str
+    feedback: str
+    revisions: int
+    reviewed: bool
+    approved: bool
+    next: str
+    log: Annotated[list, operator.add]
+
+def run_research(llm, topic, max_revisions=2):
+    def supervisor(state):
+        if not state.get("sources"):
+            nxt = "researcher"
+        elif not state.get("draft"):
+            nxt = "writer"
+        elif not state.get("reviewed"):
+            nxt = "reviewer"
+        elif state.get("approved"):
+            nxt = "FINISH"
+        elif state.get("revisions", 0) < max_revisions:
+            nxt = "writer"
+        else:
+            nxt = "FINISH"
+        return {"next": nxt}
+
+    def researcher(state):
+        return {"sources": search(state["topic"]), "log": ["researcher"]}
+
+    def writer(state):
+        titles = ", ".join(s["title"] for s in state["sources"])
+        prompt = f"Write about {state['topic']} using: {titles}"
+        if state.get("feedback"):
+            prompt += f"\nAddress feedback: {state['feedback']}"
+        body = llm.invoke(prompt)
+        refs = "\n".join(f"- {s['title']} ({s['url']})" for s in state["sources"])
+        return {
+            "draft": f"{body}\n\nSources:\n{refs}",
+            "revisions": state.get("revisions", 0) + 1,
+            "reviewed": False,
+            "log": ["writer"],
+        }
+
+    def reviewer(state):
+        reply = llm.invoke("Review this draft:\n" + state["draft"])
+        update = {"reviewed": True, "log": ["reviewer"]}
+        if reply.startswith("APPROVE"):
+            update["approved"] = True
+        elif reply.startswith("REVISE:"):
+            update["feedback"] = reply.split(":", 1)[1].strip()
+        return update
+
+    g = StateGraph(ResearchState)
+    g.add_node("supervisor", supervisor)
+    for name, fn in [("researcher", researcher), ("writer", writer), ("reviewer", reviewer)]:
+        g.add_node(name, fn)
+        g.add_edge(name, "supervisor")
+    g.add_edge(START, "supervisor")
+    g.add_conditional_edges("supervisor", lambda s: s["next"],
+                            {"researcher": "researcher", "writer": "writer", "reviewer": "reviewer", "FINISH": END})
+    out = g.compile().invoke({"topic": topic})
+    return {
+        "report": out.get("draft", ""),
+        "approved": bool(out.get("approved")),
+        "revisions": out.get("revisions", 0),
+        "log": out.get("log", []),
+    }
+::: hint
+Write the supervisor as a chain of `if/elif` checks in exactly the order given — order matters!
+::: hint
+`reply.split(":", 1)[1].strip()` grabs the feedback after "REVISE:".
+::: test approves after one revision
+llm = FakeLLM(responses=["LangGraph is great.", "REVISE: add examples", "LangGraph is great. Example: ...", "APPROVE"])
+out = run_research(llm, "LangGraph")
+assert out["log"] == ["researcher", "writer", "reviewer", "writer", "reviewer"], out["log"]
+assert out["approved"] is True and out["revisions"] == 2
+assert llm.calls[0] == "Write about LangGraph using: LangGraph docs, Multi-agent guide"
+assert llm.calls[2].endswith("\nAddress feedback: add examples")
+assert out["report"] == ("LangGraph is great. Example: ...\n\nSources:\n"
+                         "- LangGraph docs (https://langchain-ai.github.io/langgraph)\n"
+                         "- Multi-agent guide (https://example.com/multi-agent)")
+::: test reviewer sees the draft
+llm = FakeLLM(responses=["Draft body", "APPROVE"])
+out = run_research(llm, "cats")
+assert llm.calls[1].startswith("Review this draft:\nDraft body\n\nSources:\n- Wiki: cats")
+assert out["log"] == ["researcher", "writer", "reviewer"] and out["revisions"] == 1
+::: test stops at max revisions
+llm = FakeLLM(rules={"write": "meh", "review": "REVISE: better"})
+out = run_research(llm, "x", max_revisions=2)
+assert out["approved"] is False and out["revisions"] == 2
+assert out["log"].count("writer") == 2 and out["log"][-1] == "reviewer"

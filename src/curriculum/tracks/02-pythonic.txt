@@ -1,0 +1,773 @@
+=== pyx-01 | Closures: functions that remember | 2
+::: story
+A function defined inside another function can REMEMBER the outer variables,
+even after the outer function returned. That's a closure.
+```
+def make_adder(n):
+    def add(x):
+        return x + n      # n is remembered
+    return add
+add5 = make_adder(5)
+add5(1)   # 6
+```
+To REASSIGN an outer variable inside the inner function, declare it `nonlocal`.
+::: task
+1. `make_counter()` returns a function; each call returns the next integer
+   starting from 1. Separate counters are independent.
+2. `make_rate_limiter(max_calls)` returns a function `allow()` that returns
+   `True` for the first `max_calls` calls and `False` afterwards.
+::: starter
+def make_counter():
+    count = 0
+    def next_value():
+        pass
+    return next_value
+
+def make_rate_limiter(max_calls):
+    pass
+::: solution
+def make_counter():
+    count = 0
+    def next_value():
+        nonlocal count
+        count += 1
+        return count
+    return next_value
+
+def make_rate_limiter(max_calls):
+    used = 0
+    def allow():
+        nonlocal used
+        if used >= max_calls:
+            return False
+        used += 1
+        return True
+    return allow
+::: hint
+Without `nonlocal count`, `count += 1` raises UnboundLocalError.
+::: hint
+The rate limiter is the same shape: an outer `used = 0`, an inner `allow()` that checks then increments.
+::: test counter counts
+c = make_counter()
+assert [c(), c(), c()] == [1, 2, 3]
+::: test counters are independent
+a, b = make_counter(), make_counter()
+a(); a()
+assert b() == 1
+::: test rate limiter
+allow = make_rate_limiter(2)
+assert [allow(), allow(), allow(), allow()] == [True, True, False, False]
+::: test zero limit
+assert make_rate_limiter(0)() is False
+
+=== pyx-02 | Decorators: wrapping functions | 3
+::: story
+A decorator is a function that takes a function and returns a new one that
+adds behaviour around it. `@deco` above a def is shorthand for `f = deco(f)`.
+```
+import functools
+def shout(fn):
+    @functools.wraps(fn)          # keep fn.__name__ / docstring
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs).upper()
+    return wrapper
+```
+Frameworks use decorators everywhere: `@tool`, `@traceable`, `@app.get`.
+::: task
+Write a decorator `count_calls` that:
+- counts how many times the decorated function is called, exposed as an
+  attribute `wrapper.calls` (starting at 0),
+- passes through any args/kwargs and returns the original result,
+- preserves `__name__` and `__doc__` using `functools.wraps`.
+::: starter
+import functools
+
+def count_calls(fn):
+    pass
+::: solution
+import functools
+
+def count_calls(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        wrapper.calls += 1
+        return fn(*args, **kwargs)
+    wrapper.calls = 0
+    return wrapper
+::: hint
+Functions are objects — you can set attributes on them: `wrapper.calls = 0`.
+::: hint
+Inside wrapper: `wrapper.calls += 1` then `return fn(*args, **kwargs)`.
+::: test counts calls
+@count_calls
+def add(a, b=0):
+    "adds"
+    return a + b
+assert add.calls == 0
+assert add(1, b=2) == 3
+add(5)
+assert add.calls == 2
+::: test preserves metadata
+@count_calls
+def search(q):
+    "Search the web."
+    return q
+assert search.__name__ == "search" and search.__doc__ == "Search the web."
+::: test separate counters
+@count_calls
+def f(): pass
+@count_calls
+def g(): pass
+f(); f(); g()
+assert (f.calls, g.calls) == (2, 1)
+
+=== pyx-03 | Decorators with arguments: @retry | 3
+::: story
+LLM APIs fail randomly (rate limits, timeouts). A `@retry` decorator re-runs
+the call. To give a decorator arguments, add one more layer:
+```
+def repeat(n):           # 1. takes the arguments
+    def deco(fn):        # 2. takes the function
+        def wrapper(*a, **kw):   # 3. runs instead of fn
+            ...
+        return wrapper
+    return deco
+```
+::: task
+Write `retry(times, exceptions=(Exception,))`:
+- calls the function up to `times` attempts in total,
+- only retries on exceptions that are instances of `exceptions`; other
+  exceptions propagate immediately,
+- if every attempt fails, re-raise the LAST exception,
+- record the number of attempts used by the most recent call in
+  `wrapper.attempts`.
+::: starter
+import functools
+
+def retry(times, exceptions=(Exception,)):
+    pass
+::: solution
+import functools
+
+def retry(times, exceptions=(Exception,)):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            last = None
+            for attempt in range(1, times + 1):
+                wrapper.attempts = attempt
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as exc:
+                    last = exc
+            raise last
+        wrapper.attempts = 0
+        return wrapper
+    return deco
+::: hint
+`except exceptions as exc:` works with a tuple of exception classes.
+::: hint
+Loop `for attempt in range(1, times + 1)`, `return` on success, store the error otherwise, and `raise last` after the loop.
+::: test succeeds after failures
+state = {"n": 0}
+@retry(3)
+def flaky():
+    state["n"] += 1
+    if state["n"] < 3:
+        raise ConnectionError("rate limited")
+    return "ok"
+assert flaky() == "ok" and flaky.attempts == 3
+::: test raises last error
+@retry(2)
+def always():
+    raise TimeoutError("slow")
+try:
+    always()
+    assert False, "should raise"
+except TimeoutError as e:
+    assert str(e) == "slow"
+assert always.attempts == 2
+::: test does not retry other exceptions
+calls = []
+@retry(5, exceptions=(ConnectionError,))
+def bad():
+    calls.append(1)
+    raise KeyError("x")
+try:
+    bad()
+except KeyError:
+    pass
+assert len(calls) == 1, "KeyError must not be retried"
+::: test passes arguments
+@retry(1)
+def mul(a, b=2):
+    return a * b
+assert mul(3, b=4) == 12
+
+=== pyx-04 | Context managers: tracing spans | 3
+::: story
+`with` blocks guarantee cleanup code runs, even on errors. Any class with
+`__enter__` and `__exit__` works:
+```
+class Span:
+    def __enter__(self):
+        return self           # value bound by "as"
+    def __exit__(self, exc_type, exc, tb):
+        return False          # False = don't swallow the exception
+```
+Observability tools (LangSmith, OpenTelemetry) wrap every LLM call in a span.
+::: task
+1. Class `Span(name, log)` where `log` is a list:
+   - on enter append `"start <name>"`, return the span itself
+   - on normal exit append `"end <name>"`
+   - on exception append `"error <name>: <message>"` and let it propagate
+2. Function `use_setting(config, key, value)` built with
+   `@contextlib.contextmanager`: temporarily sets `config[key] = value` and
+   restores the old value afterwards (delete the key if it didn't exist) —
+   even if the block raises.
+::: starter
+import contextlib
+
+class Span:
+    def __init__(self, name, log):
+        self.name = name
+        self.log = log
+
+@contextlib.contextmanager
+def use_setting(config, key, value):
+    yield
+::: solution
+import contextlib
+
+class Span:
+    def __init__(self, name, log):
+        self.name = name
+        self.log = log
+
+    def __enter__(self):
+        self.log.append(f"start {self.name}")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.log.append(f"end {self.name}")
+        else:
+            self.log.append(f"error {self.name}: {exc}")
+        return False
+
+_MISSING = object()
+
+@contextlib.contextmanager
+def use_setting(config, key, value):
+    old = config.get(key, _MISSING)
+    config[key] = value
+    try:
+        yield config
+    finally:
+        if old is _MISSING:
+            del config[key]
+        else:
+            config[key] = old
+::: hint
+In `__exit__`, `exc_type is None` means the block finished normally.
+::: hint
+For the generator version, put `yield` inside `try:` and restore in `finally:`. Use a sentinel object to tell "missing" from "None".
+::: test span success
+log = []
+with Span("llm", log) as s:
+    assert isinstance(s, Span)
+    log.append("work")
+assert log == ["start llm", "work", "end llm"]
+::: test span error propagates
+log = []
+try:
+    with Span("tool", log):
+        raise ValueError("boom")
+    assert False, "exception was swallowed"
+except ValueError:
+    pass
+assert log == ["start tool", "error tool: boom"]
+::: test nested spans
+log = []
+with Span("chain", log):
+    with Span("llm", log):
+        pass
+assert log == ["start chain", "start llm", "end llm", "end chain"]
+::: test setting restored
+cfg = {"temp": 0.7}
+with use_setting(cfg, "temp", 0.0):
+    assert cfg["temp"] == 0.0
+assert cfg == {"temp": 0.7}
+::: test new key removed and restore on error
+cfg = {}
+try:
+    with use_setting(cfg, "debug", True):
+        assert cfg["debug"] is True
+        raise RuntimeError
+except RuntimeError:
+    pass
+assert cfg == {}
+
+=== pyx-05 | Dataclasses for messages | 2
+::: story
+`@dataclass` writes `__init__`, `__repr__` and `__eq__` for you:
+```
+from dataclasses import dataclass, field
+@dataclass
+class Point:
+    x: int
+    y: int = 0
+    tags: list = field(default_factory=list)   # never use [] as a default!
+```
+`__post_init__` runs after the generated `__init__` — great for derived fields.
+::: task
+1. `@dataclass class Message` with fields `role: str`, `content: str`,
+   `tokens: int = 0`, and `metadata: dict` defaulting to a new empty dict.
+   In `__post_init__`, if tokens is 0 set it to the word count of content.
+   Add method `to_dict()` returning `{"role": ..., "content": ...}` only.
+2. `@dataclass(frozen=True) class ModelConfig` with `name: str` and
+   `temperature: float = 0.0` — instances must be immutable and hashable.
+::: starter
+from dataclasses import dataclass, field
+
+class Message:
+    pass
+
+class ModelConfig:
+    pass
+::: solution
+from dataclasses import dataclass, field
+
+@dataclass
+class Message:
+    role: str
+    content: str
+    tokens: int = 0
+    metadata: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.tokens == 0:
+            self.tokens = len(self.content.split())
+
+    def to_dict(self):
+        return {"role": self.role, "content": self.content}
+
+@dataclass(frozen=True)
+class ModelConfig:
+    name: str
+    temperature: float = 0.0
+::: hint
+`metadata: dict = field(default_factory=dict)` gives each instance its own dict.
+::: hint
+`@dataclass(frozen=True)` makes assignments raise `FrozenInstanceError` and generates `__hash__`.
+::: test message fields and tokens
+m = Message("user", "hello there world")
+assert (m.role, m.content, m.tokens) == ("user", "hello there world", 3)
+assert Message("user", "x", tokens=10).tokens == 10
+::: test equality and repr
+assert Message("user", "hi") == Message("user", "hi")
+assert "Message(" in repr(Message("user", "hi"))
+::: test metadata not shared
+a, b = Message("user", "a"), Message("user", "b")
+a.metadata["k"] = 1
+assert b.metadata == {}, "use field(default_factory=dict)"
+::: test to_dict
+assert Message("assistant", "ok").to_dict() == {"role": "assistant", "content": "ok"}
+::: test frozen config
+import dataclasses
+cfg = ModelConfig("mini")
+try:
+    cfg.temperature = 1.0
+    assert False, "ModelConfig must be frozen"
+except dataclasses.FrozenInstanceError:
+    pass
+assert {ModelConfig("a"): 1}[ModelConfig("a")] == 1
+
+=== pyx-06 | Type hints: TypedDict & Literal | 3
+::: story
+LangGraph state is usually a `TypedDict`: a plain dict with declared keys.
+`Literal` restricts a value to specific options. Hints don't enforce anything
+at runtime, but you can INSPECT them:
+```
+from typing import Literal, TypedDict, get_args, get_type_hints
+Color = Literal["red", "blue"]
+get_args(Color)                  # ('red', 'blue')
+class P(TypedDict):
+    x: int
+get_type_hints(P)                # {'x': <class 'int'>}
+```
+::: task
+1. Define `Role = Literal["system", "user", "assistant", "tool"]`.
+2. Define `class ChatMessage(TypedDict)` with `role: Role` and `content: str`.
+3. Write `validate(msg) -> bool`: True only if msg is a dict with exactly the
+   keys of ChatMessage, content is a str and role is one of Role's options.
+   Read the keys and options FROM the type hints (don't hard-code them twice).
+::: starter
+from typing import Literal, TypedDict, get_args, get_type_hints
+
+def validate(msg) -> bool:
+    pass
+::: solution
+from typing import Literal, TypedDict, get_args, get_type_hints
+
+Role = Literal["system", "user", "assistant", "tool"]
+
+class ChatMessage(TypedDict):
+    role: Role
+    content: str
+
+def validate(msg) -> bool:
+    hints = get_type_hints(ChatMessage)
+    if not isinstance(msg, dict) or set(msg) != set(hints):
+        return False
+    return isinstance(msg["content"], str) and msg["role"] in get_args(Role)
+::: hint
+`set(get_type_hints(ChatMessage))` is `{"role", "content"}`.
+::: hint
+`msg["role"] in get_args(Role)` checks the Literal's options.
+::: test types defined
+from typing import get_args, get_type_hints
+assert get_args(Role) == ("system", "user", "assistant", "tool")
+assert set(get_type_hints(ChatMessage)) == {"role", "content"}
+::: test valid message
+assert validate({"role": "user", "content": "hi"}) is True
+::: test invalid messages
+assert validate({"role": "robot", "content": "hi"}) is False
+assert validate({"role": "user"}) is False
+assert validate({"role": "user", "content": 3}) is False
+assert validate({"role": "user", "content": "x", "extra": 1}) is False
+assert validate("nope") is False
+
+=== pyx-07 | Enums for routing | 2
+::: story
+Enums give names to a fixed set of choices — far safer than magic strings.
+```
+from enum import Enum
+class Color(Enum):
+    RED = "red"
+Color.RED.value       # "red"
+Color("red")          # Color.RED
+```
+A router agent decides which specialist handles a query.
+::: task
+1. `class Route(Enum)` with members `MATH = "math"`, `CODE = "code"`,
+   `CHAT = "chat"`.
+2. `route_for(text)` -> `Route.MATH` if the text contains a digit,
+   else `Route.CODE` if it contains "python" or "bug" (case-insensitive),
+   else `Route.CHAT`.
+3. `parse_route(value)` -> the Route for a string like `"code"` (any case);
+   unknown values return `Route.CHAT`.
+::: starter
+from enum import Enum
+
+class Route(Enum):
+    pass
+
+def route_for(text):
+    pass
+
+def parse_route(value):
+    pass
+::: solution
+from enum import Enum
+
+class Route(Enum):
+    MATH = "math"
+    CODE = "code"
+    CHAT = "chat"
+
+def route_for(text):
+    lower = text.lower()
+    if any(ch.isdigit() for ch in text):
+        return Route.MATH
+    if "python" in lower or "bug" in lower:
+        return Route.CODE
+    return Route.CHAT
+
+def parse_route(value):
+    try:
+        return Route(value.lower())
+    except ValueError:
+        return Route.CHAT
+::: hint
+`any(ch.isdigit() for ch in text)` checks for a digit.
+::: hint
+`Route("code")` looks a member up by value and raises ValueError if unknown.
+::: test members
+assert [r.value for r in Route] == ["math", "code", "chat"]
+::: test routing
+assert route_for("what is 2+2") is Route.MATH
+assert route_for("Fix my Python BUG") is Route.CODE
+assert route_for("hello!") is Route.CHAT
+::: test parse
+assert parse_route("CODE") is Route.CODE
+assert parse_route("weather") is Route.CHAT
+
+=== pyx-08 | Iterators: paginating an API | 3
+::: story
+`for x in obj` calls `iter(obj)` then `next()` repeatedly until
+`StopIteration`. Implement `__iter__` and `__next__` to make your own:
+```
+class Countdown:
+    def __init__(self, n): self.n = n
+    def __iter__(self): return self
+    def __next__(self):
+        if self.n == 0: raise StopIteration
+        self.n -= 1
+        return self.n + 1
+```
+::: task
+Write `class Paginator(items, page_size)` that yields lists (pages) of at most
+`page_size` items. Requirements:
+- implement `__iter__` and `__next__` (no generators this time),
+- `__len__` returns the number of pages,
+- iterating a second time starts over from page 1 (hint: `__iter__` resets).
+- `page_size` < 1 raises `ValueError` in `__init__`.
+::: starter
+class Paginator:
+    def __init__(self, items, page_size):
+        pass
+::: solution
+class Paginator:
+    def __init__(self, items, page_size):
+        if page_size < 1:
+            raise ValueError("page_size must be >= 1")
+        self.items = list(items)
+        self.page_size = page_size
+        self.pos = 0
+
+    def __iter__(self):
+        self.pos = 0
+        return self
+
+    def __next__(self):
+        if self.pos >= len(self.items):
+            raise StopIteration
+        page = self.items[self.pos:self.pos + self.page_size]
+        self.pos += self.page_size
+        return page
+
+    def __len__(self):
+        return (len(self.items) + self.page_size - 1) // self.page_size
+::: hint
+Keep a `self.pos` index. In `__next__`, slice a page then advance pos.
+::: hint
+Number of pages is ceiling division: `(n + size - 1) // size`.
+::: test pages
+assert list(Paginator(range(5), 2)) == [[0, 1], [2, 3], [4]]
+::: test len
+assert len(Paginator(range(5), 2)) == 3 and len(Paginator([], 3)) == 0
+::: test reiterable
+p = Paginator("abc", 2)
+assert list(p) == [["a", "b"], ["c"]]
+assert list(p) == [["a", "b"], ["c"]], "second iteration should start over"
+::: test next works
+p = iter(Paginator([1, 2, 3], 3))
+assert next(p) == [1, 2, 3]
+try:
+    next(p)
+    assert False
+except StopIteration:
+    pass
+::: test validates size
+try:
+    Paginator([1], 0)
+    assert False
+except ValueError:
+    pass
+
+=== pyx-09 | functools: caching and partials | 3
+::: story
+Embedding calls cost money. Cache them! `functools.lru_cache` memoises a
+function by its arguments. `functools.partial` pre-fills arguments:
+```
+from functools import lru_cache, partial
+@lru_cache(maxsize=None)
+def slow(x): ...
+base2 = partial(int, base=2)
+base2("101")   # 5
+```
+::: setup
+EMBED_CALLS = []
+
+def slow_embed(text):
+    """Pretend this is an expensive API call."""
+    EMBED_CALLS.append(text)
+    return tuple(float(len(w)) for w in text.split())
+
+def ask(prompt, model="mini", temperature=0.7):
+    return f"[{model}@{temperature}] {prompt}"
+::: task
+`slow_embed(text)` and `ask(prompt, model, temperature)` are provided.
+1. Write `embed(text)` that returns `slow_embed(text)` but is cached with
+   `lru_cache`, so the same text is only embedded once.
+2. Create `ask_precise` using `partial`: `ask` with `model="big"` and
+   `temperature=0.0`.
+3. Write `embed_many(texts)` returning a list of embeddings via `embed`.
+::: starter
+from functools import lru_cache, partial
+
+def embed(text):
+    return slow_embed(text)
+
+ask_precise = None
+
+def embed_many(texts):
+    pass
+::: solution
+from functools import lru_cache, partial
+
+@lru_cache(maxsize=None)
+def embed(text):
+    return slow_embed(text)
+
+ask_precise = partial(ask, model="big", temperature=0.0)
+
+def embed_many(texts):
+    return [embed(t) for t in texts]
+::: hint
+Just put `@lru_cache(maxsize=None)` on top of `def embed`.
+::: hint
+`partial(ask, model="big", temperature=0.0)` — then `ask_precise("hi")` works.
+::: test caches
+EMBED_CALLS.clear()
+embed.cache_clear()
+embed_many(["a bc", "a bc", "d"])
+assert EMBED_CALLS == ["a bc", "d"], f"slow_embed called with {EMBED_CALLS}"
+assert embed("a bc") == (1.0, 2.0)
+::: test partial
+assert ask_precise("hi") == "[big@0.0] hi"
+assert ask_precise.func is ask
+
+=== pyx-10 | collections: Counter, defaultdict, deque | 3
+::: story
+The `collections` module has battle-tested containers:
+```
+from collections import Counter, defaultdict, deque
+Counter("aab").most_common(1)       # [('a', 2)]
+groups = defaultdict(list); groups["x"].append(1)
+window = deque(maxlen=2); window.extend([1, 2, 3])   # deque([2, 3])
+```
+::: task
+1. `top_words(texts, n)` -> the n most common lowercase words across texts
+   as a list of `(word, count)`. Ties: keep Counter's order (first seen first).
+2. `group_by_source(chunks)` -> chunks look like `{"source": "a.pdf", "text": ...}`;
+   return a regular `dict` of source -> list of texts (in order). Use defaultdict.
+3. `class WindowMemory(size)` keeps only the last `size` messages:
+   `.add(msg)`, `.messages()` -> list (oldest first). Use `deque(maxlen=...)`.
+::: starter
+from collections import Counter, defaultdict, deque
+
+def top_words(texts, n):
+    pass
+
+def group_by_source(chunks):
+    pass
+
+class WindowMemory:
+    def __init__(self, size):
+        pass
+::: solution
+from collections import Counter, defaultdict, deque
+
+def top_words(texts, n):
+    counts = Counter(w for t in texts for w in t.lower().split())
+    return counts.most_common(n)
+
+def group_by_source(chunks):
+    groups = defaultdict(list)
+    for c in chunks:
+        groups[c["source"]].append(c["text"])
+    return dict(groups)
+
+class WindowMemory:
+    def __init__(self, size):
+        self._buf = deque(maxlen=size)
+
+    def add(self, msg):
+        self._buf.append(msg)
+
+    def messages(self):
+        return list(self._buf)
+::: hint
+`Counter(generator)` counts anything iterable; `.most_common(n)` gives the top n.
+::: hint
+`deque(maxlen=size)` automatically drops from the left when full.
+::: test top words
+assert top_words(["The cat", "the dog the end"], 2) == [("the", 3), ("cat", 1)]
+::: test grouping
+chunks = [{"source": "a", "text": "1"}, {"source": "b", "text": "2"}, {"source": "a", "text": "3"}]
+g = group_by_source(chunks)
+assert g == {"a": ["1", "3"], "b": ["2"]} and type(g) is dict
+::: test window memory
+m = WindowMemory(2)
+for x in "abc":
+    m.add(x)
+assert m.messages() == ["b", "c"]
+
+=== pyx-11 | Regex: parsing ReAct output | 4
+::: story
+ReAct agents make the LLM write text like:
+```
+Thought: I need the weather.
+Action: search[weather in Paris]
+```
+Your code must extract the tool name and input. Regex is the tool:
+```
+import re
+m = re.search(r"Action:\s*(\w+)\[(.*?)\]", text)
+m.group(1), m.group(2)
+re.findall(r"#(\w+)", "#a #b")      # ['a', 'b']
+```
+`re.S` (DOTALL) lets `.` match newlines.
+::: task
+1. `parse_action(text)` -> `(tool, tool_input)` from the LAST `Action: name[input]`
+   line, or `None` if there is none. Strip whitespace from the input.
+2. `parse_final(text)` -> the text after `Final Answer:` (stripped, may span
+   multiple lines), or `None`.
+3. `extract_code(text)` -> list of the contents of all fenced code blocks
+   (three backticks, optional language name after them), each stripped.
+::: starter
+import re
+
+def parse_action(text):
+    pass
+
+def parse_final(text):
+    pass
+
+def extract_code(text):
+    pass
+::: solution
+import re
+
+def parse_action(text):
+    matches = re.findall(r"Action:\s*(\w+)\[(.*?)\]", text)
+    if not matches:
+        return None
+    tool, arg = matches[-1]
+    return tool, arg.strip()
+
+def parse_final(text):
+    m = re.search(r"Final Answer:\s*(.*)", text, re.S)
+    return m.group(1).strip() if m else None
+
+def extract_code(text):
+    return [b.strip() for b in re.findall(r"`{3}[\w+-]*\n(.*?)`{3}", text, re.S)]
+::: hint
+`re.findall` with two groups returns a list of tuples; take `[-1]` for the last.
+::: hint
+For code blocks, match three backticks with a backtick followed by the quantifier {3}, then an optional language word, a newline, and a lazy (.*?) group — with re.S so it spans lines.
+::: test parse action
+t = "Thought: hmm\nAction: search[ weather in Paris ]\nObservation: 20C"
+assert parse_action(t) == ("search", "weather in Paris")
+::: test last action wins
+assert parse_action("Action: a[1]\nAction: calc[2+2]") == ("calc", "2+2")
+assert parse_action("no action here") is None
+::: test final answer
+assert parse_final("Thought: done\nFinal Answer: 42\nyes") == "42\nyes"
+assert parse_final("nothing") is None
+::: test code blocks
+fence = "`" * 3
+text = f"Here:\n{fence}python\nprint(1)\n{fence}\nand\n{fence}\nx = 2\n{fence}"
+assert extract_code(text) == ["print(1)", "x = 2"]

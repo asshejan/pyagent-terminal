@@ -1,0 +1,585 @@
+=== py-01 | Hello, Agent | 1
+::: story
+Every AI app starts with strings. Your first agent needs to introduce itself.
+In Python, an f-string lets you drop variables straight into text:
+```
+name = "Ada"
+print(f"Hi {name}!")   # Hi Ada!
+```
+::: task
+Write `make_greeting(user, model)` that RETURNS (not prints) the string:
+    Hello <user>, I am <model>.
+Example: `make_greeting("Ada", "gpt-mini")` -> `"Hello Ada, I am gpt-mini."`
+::: starter
+def make_greeting(user, model):
+    # use an f-string and return it
+    pass
+::: solution
+def make_greeting(user, model):
+    return f"Hello {user}, I am {model}."
+::: hint
+`return f"Hello {user}, ..."` — the braces are replaced by the variable's value.
+::: hint
+Don't forget the comma after the user name and the full stop at the end.
+::: test basic greeting
+assert make_greeting("Ada", "gpt-mini") == "Hello Ada, I am gpt-mini.", make_greeting("Ada", "gpt-mini")
+::: test other names
+assert make_greeting("Linus", "claude") == "Hello Linus, I am claude."
+::: test returns a string (not print)
+assert isinstance(make_greeting("a", "b"), str)
+::: realworld
+System prompts are built exactly like this:
+    system = f"You are {bot_name}, a helpful assistant for {company}."
+
+=== py-02 | Trimming the context window | 1
+::: story
+LLMs have a limited context window. A common trick: always keep the first
+message (the system prompt) plus only the most recent messages.
+List slicing makes this easy:
+```
+xs = [10, 20, 30, 40, 50]
+xs[0]      # 10
+xs[-2:]    # [40, 50]
+xs[1:3]    # [20, 30]
+```
+::: task
+Write `trim_context(messages, keep)` that returns a NEW list containing the
+first message followed by the last `keep` messages of the rest.
+- If there are `keep + 1` messages or fewer, return a copy of all of them.
+- Never duplicate the first message.
+Example: `trim_context(["sys","a","b","c","d"], 2)` -> `["sys","c","d"]`
+::: starter
+def trim_context(messages, keep):
+    pass
+::: solution
+def trim_context(messages, keep):
+    if len(messages) <= keep + 1:
+        return list(messages)
+    rest = messages[1:]
+    return [messages[0]] + rest[len(rest) - keep:]
+::: hint
+`messages[0]` is the system prompt; `messages[1:]` is everything else.
+::: hint
+`rest[-keep:]` gives the last `keep` items — but careful: `rest[-0:]` is the WHOLE list! Use `rest[len(rest) - keep:]` to be safe when keep is 0.
+::: test keeps system + last two
+assert trim_context(["sys", "a", "b", "c", "d"], 2) == ["sys", "c", "d"]
+::: test short history unchanged
+assert trim_context(["sys", "a"], 3) == ["sys", "a"]
+::: test keep zero
+assert trim_context(["sys", "a", "b"], 0) == ["sys"]
+::: test returns a new list
+orig = ["sys", "a"]
+out = trim_context(orig, 5)
+out.append("x")
+assert orig == ["sys", "a"], "you returned the same list object - return a copy"
+
+=== py-03 | Who said what? | 1
+::: story
+Chat history is usually a list of dicts with a "role" and "content":
+```
+messages = [
+    {"role": "system", "content": "Be brief."},
+    {"role": "user", "content": "Hi"},
+    {"role": "assistant", "content": "Hello!"},
+]
+```
+Dicts map keys to values: `d["role"]`, `d.get("x", default)`, `for k, v in d.items()`.
+::: task
+Write `count_roles(messages)` returning a dict of role -> how many messages
+have that role. Example: the list above -> `{"system": 1, "user": 1, "assistant": 1}`
+Empty list -> `{}`
+::: starter
+def count_roles(messages):
+    counts = {}
+    # loop over messages and count each role
+    return counts
+::: solution
+def count_roles(messages):
+    counts = {}
+    for m in messages:
+        counts[m["role"]] = counts.get(m["role"], 0) + 1
+    return counts
+::: hint
+`counts.get(role, 0)` returns 0 the first time you see a role.
+::: hint
+`counts[role] = counts.get(role, 0) + 1`
+::: test counts each role
+msgs = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}]
+assert count_roles(msgs) == {"user": 2, "assistant": 1}
+::: test empty
+assert count_roles([]) == {}
+::: test single role
+assert count_roles([{"role": "tool", "content": "42"}] * 3) == {"tool": 3}
+
+=== py-04 | Token budget | 1
+::: story
+APIs charge per token. Let's pretend 1 word = 1 token.
+`len("a b c".split())` is 3. Loops plus a running total let you stop
+as soon as a budget would be exceeded. `break` exits a loop early.
+::: task
+Write `fit_budget(texts, budget)` returning the list of texts, taken from the
+START, whose combined word count stays <= budget. Stop at the first text that
+would go over (don't skip ahead to smaller ones).
+Example: `fit_budget(["a b", "c d e", "f"], 5)` -> `["a b", "c d e"]`
+::: starter
+def fit_budget(texts, budget):
+    kept = []
+    used = 0
+    return kept
+::: solution
+def fit_budget(texts, budget):
+    kept = []
+    used = 0
+    for t in texts:
+        n = len(t.split())
+        if used + n > budget:
+            break
+        kept.append(t)
+        used += n
+    return kept
+::: hint
+For each text compute `n = len(text.split())`, then check `used + n > budget`.
+::: hint
+If it would go over, `break`. Otherwise append it and add `n` to `used`.
+::: test fits two
+assert fit_budget(["a b", "c d e", "f"], 5) == ["a b", "c d e"]
+::: test stops at first overflow
+assert fit_budget(["a b c d", "e f g", "h"], 5) == ["a b c d"], "stop at the first text that doesn't fit"
+::: test zero budget
+assert fit_budget(["a"], 0) == []
+::: test everything fits
+assert fit_budget(["a", "b"], 10) == ["a", "b"]
+
+=== py-05 | Building an API request | 1
+::: story
+Functions can have default parameter values, so callers only pass what they
+want to change:
+```
+def connect(host, port=443):
+    ...
+connect("api.example.com")            # port is 443
+connect("localhost", port=8080)       # keyword argument
+```
+::: task
+Write `build_request(prompt, model="mini", temperature=0.7, max_tokens=256)`
+that returns a dict:
+    {"model": ..., "messages": [{"role": "user", "content": prompt}],
+     "temperature": ..., "max_tokens": ...}
+Temperature must be clamped into the range 0.0 to 2.0 (e.g. 5 -> 2.0, -1 -> 0.0).
+::: starter
+def build_request(prompt):
+    pass
+::: solution
+def build_request(prompt, model="mini", temperature=0.7, max_tokens=256):
+    temperature = max(0.0, min(2.0, temperature))
+    return {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+::: hint
+Add the three keyword parameters with defaults to the `def` line.
+::: hint
+Clamp with `max(0.0, min(2.0, temperature))`.
+::: test defaults
+r = build_request("hi")
+assert r == {"model": "mini", "messages": [{"role": "user", "content": "hi"}], "temperature": 0.7, "max_tokens": 256}, r
+::: test keyword overrides
+r = build_request("x", model="big", max_tokens=10)
+assert r["model"] == "big" and r["max_tokens"] == 10
+::: test clamps temperature
+assert build_request("x", temperature=5)["temperature"] == 2.0
+assert build_request("x", temperature=-1)["temperature"] == 0.0
+::: realworld
+This is the shape of a real chat-completions request body:
+    client.chat.completions.create(model=..., messages=[...], temperature=0.2)
+
+=== py-06 | Cleaning a dataset | 2
+::: story
+Comprehensions build lists/dicts in one readable line:
+```
+squares = [x * x for x in range(5) if x % 2 == 0]   # [0, 4, 16]
+lengths = {w: len(w) for w in ["hi", "hello"]}      # {"hi": 2, "hello": 5}
+```
+Before you embed documents you usually normalise them.
+::: task
+1. `clean_docs(docs)` -> list of docs stripped of surrounding whitespace and
+   lowercased, with empty/whitespace-only docs removed. Use a list comprehension.
+2. `vocab(docs)` -> dict mapping each distinct word (across all cleaned docs) to
+   its length. Use a dict comprehension.
+Example: `clean_docs(["  Hello ", "", "AI  "])` -> `["hello", "ai"]`
+::: starter
+def clean_docs(docs):
+    pass
+
+def vocab(docs):
+    pass
+::: solution
+def clean_docs(docs):
+    return [d.strip().lower() for d in docs if d.strip()]
+
+def vocab(docs):
+    return {w: len(w) for d in clean_docs(docs) for w in d.split()}
+::: hint
+`if d.strip()` is falsy for an empty string, so it filters blanks.
+::: hint
+A comprehension can have two `for`s: `{w: len(w) for d in docs for w in d.split()}`
+::: test cleans and drops blanks
+assert clean_docs(["  Hello ", "", "AI  ", "   "]) == ["hello", "ai"]
+::: test vocab
+assert vocab(["Big Model", "big data"]) == {"big": 3, "model": 5, "data": 4}
+::: test empty input
+assert clean_docs([]) == [] and vocab([]) == {}
+
+=== py-07 | Parsing config strings | 2
+::: story
+Agents often receive settings as text like `"model=gpt temp=0.2 stream=true"`.
+`str.split`, `str.partition` and type conversion turn it into real data:
+```
+"a=1".split("=")     # ["a", "1"]
+int("42"), float("0.5")
+```
+::: task
+Write `parse_kv(text)` returning a dict. Values are converted:
+- `"true"` / `"false"` (any case) -> `True` / `False`
+- whole numbers -> `int`, decimals -> `float`
+- anything else stays a `str`
+Pairs are separated by whitespace. Ignore tokens without `=`.
+Example: `parse_kv("model=gpt temp=0.2 n=3 stream=TRUE")`
+-> `{"model": "gpt", "temp": 0.2, "n": 3, "stream": True}`
+::: starter
+def convert(value):
+    # turn "3" -> 3, "0.2" -> 0.2, "true" -> True, else keep the string
+    return value
+
+def parse_kv(text):
+    pass
+::: solution
+def convert(value):
+    if value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+def parse_kv(text):
+    result = {}
+    for token in text.split():
+        if "=" not in token:
+            continue
+        key, _, value = token.partition("=")
+        result[key] = convert(value)
+    return result
+::: hint
+Try `int(value)` inside `try/except ValueError`, then `float(value)` the same way.
+::: hint
+`key, _, value = token.partition("=")` splits on the FIRST `=` only.
+::: test mixed types
+assert parse_kv("model=gpt temp=0.2 n=3 stream=TRUE") == {"model": "gpt", "temp": 0.2, "n": 3, "stream": True}
+::: test bool false
+assert parse_kv("debug=false")["debug"] is False
+::: test ignores junk tokens
+assert parse_kv("hello a=1 world") == {"a": 1}
+::: test value containing =
+assert parse_kv("expr=a=b") == {"expr": "a=b"}
+::: test empty
+assert parse_kv("") == {}
+
+=== py-08 | Flexible loggers with *args and **kwargs | 2
+::: story
+`*args` collects extra positional arguments into a tuple, `**kwargs` collects
+extra keyword arguments into a dict. Tracing libraries (like LangSmith) use this
+to accept any metadata:
+```
+def f(*args, **kwargs):
+    print(args, kwargs)
+f(1, 2, x=3)   # (1, 2) {'x': 3}
+```
+::: task
+Write `log_event(event, *tags, **fields)` returning a string:
+    "<event> [tag1,tag2] key1=val1 key2=val2"
+- tags joined by commas inside brackets; omit the brackets part if no tags
+- fields sorted by key, formatted `key=value`; omit if none
+- parts separated by single spaces
+Examples:
+`log_event("llm_call", "prod", "gpt", tokens=12, latency=0.4)`
+-> `"llm_call [prod,gpt] latency=0.4 tokens=12"`
+`log_event("start")` -> `"start"`
+::: starter
+def log_event(event):
+    pass
+::: solution
+def log_event(event, *tags, **fields):
+    parts = [event]
+    if tags:
+        parts.append("[" + ",".join(tags) + "]")
+    for key in sorted(fields):
+        parts.append(f"{key}={fields[key]}")
+    return " ".join(parts)
+::: hint
+Build a list `parts = [event]`, append pieces, finish with `" ".join(parts)`.
+::: hint
+`sorted(fields)` iterates the keys of the kwargs dict in alphabetical order.
+::: test full
+assert log_event("llm_call", "prod", "gpt", tokens=12, latency=0.4) == "llm_call [prod,gpt] latency=0.4 tokens=12"
+::: test event only
+assert log_event("start") == "start"
+::: test fields only
+assert log_event("x", b=2, a=1) == "x a=1 b=2"
+::: test tags only
+assert log_event("x", "t") == "x [t]"
+
+=== py-09 | Parsing LLM scores safely | 2
+::: story
+LLMs are unreliable narrators. Ask for "a score from 0 to 10" and you might get
+`"Score: 7.5"`, `"8/10"`, or `"I'd say great!"`. Robust code raises clear
+errors and handles them where it makes sense:
+```
+try:
+    x = float("abc")
+except ValueError as e:
+    print("bad:", e)
+```
+::: task
+1. `parse_score(text)` finds the FIRST number in the text (int or decimal) and
+   returns it as a float. Raise `ValueError` if there is no number, or if the
+   number is outside 0..10.
+2. `safe_score(text, default=0.0)` calls `parse_score` and returns `default`
+   instead of raising.
+Examples: `parse_score("Score: 7.5")` -> 7.5, `parse_score("8/10")` -> 8.0
+Hint: `import re; re.search(r"\d+(\.\d+)?", text)`
+::: starter
+import re
+
+def parse_score(text):
+    pass
+
+def safe_score(text, default=0.0):
+    pass
+::: solution
+import re
+
+def parse_score(text):
+    match = re.search(r"\d+(\.\d+)?", text)
+    if not match:
+        raise ValueError(f"no score found in {text!r}")
+    score = float(match.group())
+    if not 0 <= score <= 10:
+        raise ValueError(f"score {score} out of range 0..10")
+    return score
+
+def safe_score(text, default=0.0):
+    try:
+        return parse_score(text)
+    except ValueError:
+        return default
+::: hint
+`match.group()` returns the matched text, e.g. "7.5". Convert with `float()`.
+::: hint
+`raise ValueError("message")` when there's no match or `not 0 <= score <= 10`.
+::: test finds decimal
+assert parse_score("Score: 7.5") == 7.5
+::: test first number wins
+assert parse_score("8/10") == 8.0
+::: test raises when no number
+try:
+    parse_score("great!")
+    assert False, "expected ValueError"
+except ValueError:
+    pass
+::: test raises when out of range
+try:
+    parse_score("score 11")
+    assert False, "expected ValueError for 11"
+except ValueError:
+    pass
+::: test safe_score defaults
+assert safe_score("nope") == 0.0
+assert safe_score("nope", default=-1) == -1
+assert safe_score("10") == 10.0
+
+=== py-10 | Ranking search results | 2
+::: story
+`sorted()` takes a `key` function; `lambda` makes tiny inline functions:
+```
+words = ["bbb", "a", "cc"]
+sorted(words, key=lambda w: len(w))            # ['a', 'cc', 'bbb']
+sorted(words, key=lambda w: len(w), reverse=True)
+sorted(pairs, key=lambda p: (-p[1], p[0]))     # score desc, then name asc
+```
+::: task
+Results look like `{"doc": "a.txt", "score": 0.8}`.
+1. `rank(results)` -> new list sorted by score descending; ties broken by doc
+   name ascending.
+2. `top_k(results, k, min_score=0.0)` -> the first `k` ranked results whose
+   score is >= min_score.
+::: starter
+def rank(results):
+    pass
+
+def top_k(results, k, min_score=0.0):
+    pass
+::: solution
+def rank(results):
+    return sorted(results, key=lambda r: (-r["score"], r["doc"]))
+
+def top_k(results, k, min_score=0.0):
+    return [r for r in rank(results) if r["score"] >= min_score][:k]
+::: hint
+Sort key returning a tuple: `(-r["score"], r["doc"])` — negative score sorts high first.
+::: hint
+For top_k: filter with a comprehension, then slice `[:k]`.
+::: test ranks with ties
+rs = [{"doc": "b", "score": 0.5}, {"doc": "a", "score": 0.5}, {"doc": "c", "score": 0.9}]
+assert [r["doc"] for r in rank(rs)] == ["c", "a", "b"]
+::: test does not mutate input
+rs = [{"doc": "b", "score": 0.1}, {"doc": "a", "score": 0.9}]
+rank(rs)
+assert rs[0]["doc"] == "b", "use sorted(), not .sort()"
+::: test top_k with threshold
+rs = [{"doc": "x", "score": 0.2}, {"doc": "y", "score": 0.7}, {"doc": "z", "score": 0.6}]
+assert [r["doc"] for r in top_k(rs, 5, min_score=0.5)] == ["y", "z"]
+assert [r["doc"] for r in top_k(rs, 1)] == ["y"]
+
+=== py-11 | Streaming tokens with generators | 3
+::: story
+Chat UIs show the answer as it's generated. In Python that's a GENERATOR: a
+function that `yield`s values one at a time instead of returning a list.
+```
+def count_up(n):
+    for i in range(n):
+        yield i
+for x in count_up(3): print(x)   # 0 1 2
+list(count_up(3))                # [0, 1, 2]
+```
+Nothing runs until someone asks for the next value — that's laziness.
+::: task
+1. `stream_words(text, size=2)` yields chunks of `size` words joined by spaces.
+   `list(stream_words("a b c d e", 2))` -> `["a b", "c d", "e"]`
+2. `with_index(stream)` takes any iterable and yields `(i, chunk)` pairs
+   starting at 1. (Don't use `enumerate` — practise `yield`!)
+3. `first_n(stream, n)` returns a list of the first n items WITHOUT consuming
+   more of the stream than needed (it may be infinite!).
+::: starter
+def stream_words(text, size=2):
+    pass
+
+def with_index(stream):
+    pass
+
+def first_n(stream, n):
+    pass
+::: solution
+def stream_words(text, size=2):
+    words = text.split()
+    for i in range(0, len(words), size):
+        yield " ".join(words[i:i + size])
+
+def with_index(stream):
+    i = 1
+    for chunk in stream:
+        yield (i, chunk)
+        i += 1
+
+def first_n(stream, n):
+    out = []
+    if n <= 0:
+        return out
+    for item in stream:
+        out.append(item)
+        if len(out) == n:
+            break
+    return out
+::: hint
+`range(0, len(words), size)` steps through start positions 0, size, 2*size...
+::: hint
+For first_n, `break` as soon as you have n items. Test it on `itertools.count()` which never ends.
+::: test chunks words
+assert list(stream_words("a b c d e", 2)) == ["a b", "c d", "e"]
+::: test is a generator
+import types
+assert isinstance(stream_words("a b"), types.GeneratorType), "use yield"
+::: test with_index
+import types
+assert list(with_index(["x", "y"])) == [(1, "x"), (2, "y")]
+assert isinstance(with_index([]), types.GeneratorType), "use yield"
+::: test first_n on infinite stream
+import itertools
+assert first_n(itertools.count(), 3) == [0, 1, 2]
+::: test first_n consumes only n
+it = iter([1, 2, 3, 4])
+first_n(it, 2)
+assert next(it) == 3, "you consumed too many items"
+::: realworld
+LangChain: `for chunk in llm.stream("hi"): print(chunk.content, end="")`
+
+=== py-12 | JSON in, JSON out | 3
+::: story
+Every API speaks JSON. `json.dumps` turns Python data into a string;
+`json.loads` parses a string back.
+```
+import json
+json.dumps({"a": 1})        # '{"a": 1}'
+json.loads('[1, 2]')        # [1, 2]
+```
+Models also produce JSON, often wrapped in chatter — you must validate it.
+::: task
+1. `dump_messages(messages)` -> JSON string of the list (use `json.dumps`).
+2. `load_messages(text)` -> parse a JSON string and return a list of message
+   dicts. Raise `ValueError` if:
+   - the JSON is invalid (hint: `json.JSONDecodeError` is a subclass of ValueError),
+   - the top-level value is not a list,
+   - any item isn't a dict with string "role" and "content" keys,
+   - a role is not one of "system", "user", "assistant", "tool".
+::: starter
+import json
+
+VALID_ROLES = {"system", "user", "assistant", "tool"}
+
+def dump_messages(messages):
+    pass
+
+def load_messages(text):
+    pass
+::: solution
+import json
+
+VALID_ROLES = {"system", "user", "assistant", "tool"}
+
+def dump_messages(messages):
+    return json.dumps(messages)
+
+def load_messages(text):
+    data = json.loads(text)
+    if not isinstance(data, list):
+        raise ValueError("expected a list of messages")
+    for i, m in enumerate(data):
+        if not isinstance(m, dict):
+            raise ValueError(f"message {i} is not an object")
+        if not isinstance(m.get("role"), str) or not isinstance(m.get("content"), str):
+            raise ValueError(f"message {i} needs string role and content")
+        if m["role"] not in VALID_ROLES:
+            raise ValueError(f"message {i} has invalid role {m['role']!r}")
+    return data
+::: hint
+`json.loads` already raises a ValueError subclass for broken JSON — you can let it propagate.
+::: hint
+Check `isinstance(data, list)`, then loop and check each item with `isinstance(m, dict)` and `m.get("role")`.
+::: test round trip
+msgs = [{"role": "user", "content": "hi"}]
+assert load_messages(dump_messages(msgs)) == msgs
+::: test dump returns str
+assert isinstance(dump_messages([]), str)
+::: test rejects bad json
+for bad in ["{not json", '{"role": "user"}', '[1, 2]', '[{"role": "user"}]', '[{"role": "robot", "content": "x"}]']:
+    try:
+        load_messages(bad)
+        assert False, f"should reject {bad}"
+    except ValueError:
+        pass

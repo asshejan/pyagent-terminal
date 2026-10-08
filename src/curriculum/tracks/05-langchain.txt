@@ -1,0 +1,857 @@
+=== lc-01 | Wrapping a chat model | 2
+::: story
+From here on, `FakeLLM` stands in for a real model (type `setup` to read its
+code). `FakeLLM(rules={"hello": "Hi!"})` replies by keyword;
+`FakeLLM(responses=["a", "b"])` replies from a queue. Every prompt it receives
+is recorded in `llm.calls`.
+LangChain chat models accept EITHER a string or a list of messages, and
+return an AIMessage. Let's build that adapter.
+::: setup fake_llm
+::: task
+Write `class ChatModel(llm, system=None)`:
+- `invoke(input)`: if input is a str, turn it into `[{"role": "user", "content": input}]`;
+  if it's a list, copy it. If `system` is set, prepend a system message.
+  Pass the message list to `llm.invoke(...)` and return
+  `{"role": "assistant", "content": <reply>}`.
+- `batch(inputs)` -> list of invoke results.
+::: starter
+class ChatModel:
+    def __init__(self, llm, system=None):
+        self.llm = llm
+        self.system = system
+
+    def invoke(self, input):
+        pass
+::: solution
+class ChatModel:
+    def __init__(self, llm, system=None):
+        self.llm = llm
+        self.system = system
+
+    def invoke(self, input):
+        if isinstance(input, str):
+            messages = [{"role": "user", "content": input}]
+        else:
+            messages = list(input)
+        if self.system:
+            messages = [{"role": "system", "content": self.system}] + messages
+        return {"role": "assistant", "content": self.llm.invoke(messages)}
+
+    def batch(self, inputs):
+        return [self.invoke(x) for x in inputs]
+::: hint
+`isinstance(input, str)` tells you which shape you got.
+::: hint
+The FakeLLM records what you sent in `llm.calls` — the tests inspect it.
+::: test string input
+llm = FakeLLM(rules={"hello": "Hi there!"})
+model = ChatModel(llm)
+assert model.invoke("hello bot") == {"role": "assistant", "content": "Hi there!"}
+assert llm.calls[0] == [{"role": "user", "content": "hello bot"}]
+::: test system prompt and lists
+llm = FakeLLM(responses=["ok"])
+model = ChatModel(llm, system="be brief")
+history = [{"role": "user", "content": "q"}]
+model.invoke(history)
+assert llm.calls[0] == [{"role": "system", "content": "be brief"}, {"role": "user", "content": "q"}]
+assert history == [{"role": "user", "content": "q"}], "don't mutate the caller's list"
+::: test batch
+model = ChatModel(FakeLLM(responses=["1", "2"]))
+assert [r["content"] for r in model.batch(["a", "b"])] == ["1", "2"]
+::: realworld
+    from langchain_anthropic import ChatAnthropic
+    llm = ChatAnthropic(model="claude-sonnet-5-5")
+    llm.invoke("hello").content
+
+=== lc-02 | The Runnable interface | 2
+::: story
+LangChain's core idea: EVERYTHING (prompts, models, parsers, retrievers,
+whole chains) is a `Runnable` with the same methods: `invoke`, `batch`,
+`stream`. Uniform interfaces are what make components composable.
+::: task
+1. `class Runnable` (base): `invoke(input)` raises `NotImplementedError`;
+   `batch(inputs)` -> list of invoke results; `stream(input)` is a generator
+   that yields the single invoke result (subclasses may override).
+2. `class RunnableLambda(Runnable)` wraps a function: `invoke(x)` -> `fn(x)`.
+   Its `repr` is `RunnableLambda(<function name>)`.
+3. `class WordStreamer(Runnable)`: invoke returns the text unchanged, but
+   `stream(text)` yields each word separately (overrides the default).
+::: starter
+class Runnable:
+    pass
+
+class RunnableLambda(Runnable):
+    pass
+
+class WordStreamer(Runnable):
+    pass
+::: solution
+class Runnable:
+    def invoke(self, input):
+        raise NotImplementedError
+
+    def batch(self, inputs):
+        return [self.invoke(x) for x in inputs]
+
+    def stream(self, input):
+        yield self.invoke(input)
+
+class RunnableLambda(Runnable):
+    def __init__(self, fn):
+        self.fn = fn
+
+    def invoke(self, input):
+        return self.fn(input)
+
+    def __repr__(self):
+        return f"RunnableLambda({self.fn.__name__})"
+
+class WordStreamer(Runnable):
+    def invoke(self, input):
+        return input
+
+    def stream(self, input):
+        for word in input.split():
+            yield word
+::: hint
+`stream` in the base class is just `yield self.invoke(input)`.
+::: hint
+`self.fn.__name__` gives a function's name for the repr.
+::: test base
+try:
+    Runnable().invoke(1)
+    assert False
+except NotImplementedError:
+    pass
+::: test lambda
+double = RunnableLambda(lambda x: x * 2)
+assert double.invoke(4) == 8 and double.batch([1, 2]) == [2, 4]
+assert list(double.stream(3)) == [6]
+def shout(s): return s.upper()
+assert repr(RunnableLambda(shout)) == "RunnableLambda(shout)"
+::: test word streamer
+w = WordStreamer()
+assert w.invoke("a b") == "a b" and list(w.stream("a b c")) == ["a", "b", "c"]
+assert isinstance(w, Runnable) and w.batch(["x"]) == ["x"]
+
+=== lc-03 | LCEL: the pipe operator | 3
+::: story
+`prompt | llm | parser` is LangChain Expression Language. It works because
+Runnable defines `__or__`: `a | b` calls `a.__or__(b)` which returns a
+`RunnableSequence` that feeds a's output into b.
+If the left side isn't a Runnable (e.g. a plain function), Python tries the
+RIGHT side's `__ror__`.
+::: task
+1. `coerce(obj)`: return obj if it's a Runnable; wrap callables in
+   `RunnableLambda`; otherwise raise `TypeError`.
+2. Give `Runnable` an `__or__(other)` and `__ror__(other)`, both returning a
+   `RunnableSequence` (coercing the non-Runnable side).
+3. `class RunnableSequence(Runnable)`: stores `steps` (a flat list — piping
+   sequences together must NOT nest them), and `invoke` runs each step in order.
+::: starter
+class Runnable:
+    def invoke(self, input):
+        raise NotImplementedError
+
+    def batch(self, inputs):
+        return [self.invoke(x) for x in inputs]
+
+class RunnableLambda(Runnable):
+    def __init__(self, fn):
+        self.fn = fn
+
+    def invoke(self, input):
+        return self.fn(input)
+
+def coerce(obj):
+    pass
+
+class RunnableSequence(Runnable):
+    pass
+::: solution
+class Runnable:
+    def invoke(self, input):
+        raise NotImplementedError
+
+    def batch(self, inputs):
+        return [self.invoke(x) for x in inputs]
+
+    def __or__(self, other):
+        return RunnableSequence(self, coerce(other))
+
+    def __ror__(self, other):
+        return RunnableSequence(coerce(other), self)
+
+class RunnableLambda(Runnable):
+    def __init__(self, fn):
+        self.fn = fn
+
+    def invoke(self, input):
+        return self.fn(input)
+
+def coerce(obj):
+    if isinstance(obj, Runnable):
+        return obj
+    if callable(obj):
+        return RunnableLambda(obj)
+    raise TypeError(f"cannot pipe {type(obj).__name__}")
+
+class RunnableSequence(Runnable):
+    def __init__(self, *steps):
+        self.steps = []
+        for step in steps:
+            if isinstance(step, RunnableSequence):
+                self.steps.extend(step.steps)
+            else:
+                self.steps.append(step)
+
+    def invoke(self, input):
+        for step in self.steps:
+            input = step.invoke(input)
+        return input
+::: hint
+In `RunnableSequence.__init__`, if a step is itself a RunnableSequence, `extend` with its steps instead of appending it.
+::: hint
+`__ror__(self, other)` handles `function | runnable`: return `RunnableSequence(coerce(other), self)`.
+::: test pipe
+add1 = RunnableLambda(lambda x: x + 1)
+dbl = RunnableLambda(lambda x: x * 2)
+chain = add1 | dbl
+assert isinstance(chain, RunnableSequence) and chain.invoke(3) == 8
+::: test flat steps
+a, b, c = (RunnableLambda(lambda x: x) for _ in range(3))
+assert len((a | b | c).steps) == 3, "sequences must be flattened"
+::: test functions on either side
+chain = (lambda s: s.strip()) | RunnableLambda(str.upper) | (lambda s: s + "!")
+assert chain.invoke("  hi ") == "HI!"
+assert chain.batch(["a", "b"]) == ["A!", "B!"]
+::: test bad pipe
+try:
+    RunnableLambda(str) | 42
+    assert False
+except TypeError:
+    pass
+
+=== lc-04 | Parallel branches & passthrough | 3
+::: story
+Real chains need fan-out: run several runnables on the SAME input and collect
+a dict. In LCEL a plain dict in a pipe means "run these in parallel":
+```
+{"context": retriever, "question": RunnablePassthrough()} | prompt
+```
+The base Runnable/RunnableLambda/RunnableSequence are provided (type `setup`).
+::: setup
+class Runnable:
+    def invoke(self, input):
+        raise NotImplementedError
+
+    def batch(self, inputs):
+        return [self.invoke(x) for x in inputs]
+
+    def __or__(self, other):
+        return RunnableSequence(self, coerce(other))
+
+    def __ror__(self, other):
+        return RunnableSequence(coerce(other), self)
+
+class RunnableLambda(Runnable):
+    def __init__(self, fn):
+        self.fn = fn
+
+    def invoke(self, input):
+        return self.fn(input)
+
+class RunnableSequence(Runnable):
+    def __init__(self, *steps):
+        self.steps = list(steps)
+
+    def invoke(self, input):
+        for step in self.steps:
+            input = step.invoke(input)
+        return input
+
+def coerce(obj):
+    if isinstance(obj, Runnable):
+        return obj
+    if isinstance(obj, dict) and "RunnableParallel" in globals():
+        return globals()["RunnableParallel"](obj)
+    if callable(obj):
+        return RunnableLambda(obj)
+    raise TypeError(f"cannot pipe {type(obj).__name__}")
+::: task
+1. `class RunnableParallel(Runnable)`: `RunnableParallel(steps_dict)` coerces
+   each value; `invoke(x)` returns `{key: step.invoke(x)}`. (Once it exists,
+   `coerce` turns dicts into it automatically, so `{...} | something` works.)
+2. `class RunnablePassthrough(Runnable)`: returns its input unchanged.
+   Add a classmethod `assign(**steps)` returning a Runnable that takes a dict
+   and returns a NEW dict with the original keys plus each step's result
+   (each step receives the original dict).
+::: starter
+class RunnableParallel(Runnable):
+    pass
+
+class RunnablePassthrough(Runnable):
+    pass
+::: solution
+class RunnableParallel(Runnable):
+    def __init__(self, steps):
+        self.steps = {k: coerce(v) for k, v in steps.items()}
+
+    def invoke(self, input):
+        return {k: step.invoke(input) for k, step in self.steps.items()}
+
+class RunnablePassthrough(Runnable):
+    def invoke(self, input):
+        return input
+
+    @classmethod
+    def assign(cls, **steps):
+        parallel = RunnableParallel(steps)
+        return RunnableLambda(lambda d: {**d, **parallel.invoke(d)})
+::: hint
+`assign` can reuse RunnableParallel: compute the new keys, then merge `{**d, **new}`.
+::: hint
+Remember `coerce(v)` so plain lambdas work as branch values.
+::: test parallel
+p = RunnableParallel({"up": str.upper, "len": len})
+assert p.invoke("abc") == {"up": "ABC", "len": 3}
+::: test dict in a pipe
+chain = RunnableLambda(str.strip) | {"text": RunnablePassthrough(), "words": lambda s: len(s.split())}
+assert chain.invoke("  a b  ") == {"text": "a b", "words": 2}
+::: test assign
+step = RunnablePassthrough.assign(total=lambda d: d["a"] + d["b"])
+data = {"a": 1, "b": 2}
+assert step.invoke(data) == {"a": 1, "b": 2, "total": 3}
+assert data == {"a": 1, "b": 2}, "assign must not mutate its input"
+::: realworld
+    from langchain_core.runnables import RunnableParallel, RunnablePassthrough
+
+=== lc-05 | Output parsers | 3
+::: story
+Models return messages; your code wants Python objects. Output parsers sit at
+the end of a chain and convert. The `mini_lc` prelude provides `Runnable`
+(type `setup` to read it). Model output may be a str or an AIMessage-like
+dict `{"role": "assistant", "content": "..."}`.
+::: setup mini_lc
+::: task
+Subclass `Runnable` to write:
+1. `TextParser`: returns the content as a stripped str (works for str or dict).
+2. `ListParser`: parses either comma-separated text (`"a, b, c"`) or one item
+   per line with optional bullets (`"- a\n* b\n1. c"`) into a list of
+   non-empty stripped strings. If the text contains newlines, treat it as
+   lines; otherwise split on commas.
+3. `JsonParser`: parses the content as JSON, also handling a fenced code
+   block; on failure raise `ValueError("could not parse JSON: ...")`.
+::: starter
+import json
+import re
+
+class TextParser(Runnable):
+    pass
+
+class ListParser(Runnable):
+    pass
+
+class JsonParser(Runnable):
+    pass
+::: solution
+import json
+import re
+
+def _content(x):
+    return str(x.get("content", "")) if isinstance(x, dict) else str(x)
+
+class TextParser(Runnable):
+    def invoke(self, input):
+        return _content(input).strip()
+
+class ListParser(Runnable):
+    def invoke(self, input):
+        text = _content(input).strip()
+        if "\n" in text:
+            items = [re.sub(r"^\s*(?:[-*]|\d+\.)\s*", "", line) for line in text.splitlines()]
+        else:
+            items = text.split(",")
+        return [i.strip() for i in items if i.strip()]
+
+class JsonParser(Runnable):
+    def invoke(self, input):
+        text = _content(input)
+        fenced = re.search(r"`{3}(?:json)?\s*(.*?)`{3}", text, re.S)
+        if fenced:
+            text = fenced.group(1)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"could not parse JSON: {exc}") from exc
+::: hint
+A tiny helper `_content(x)` that handles both str and dict keeps every parser short.
+::: hint
+Strip bullets with `re.sub(r"^\s*(?:[-*]|\d+\.)\s*", "", line)`.
+::: test text parser
+assert TextParser().invoke({"role": "assistant", "content": "  hi \n"}) == "hi"
+assert TextParser().invoke(" yo ") == "yo"
+::: test list parser
+assert ListParser().invoke("a, b ,c,") == ["a", "b", "c"]
+assert ListParser().invoke({"content": "- apples\n* pears\n1. plums\n\n"}) == ["apples", "pears", "plums"]
+::: test json parser
+fence = "`" * 3
+assert JsonParser().invoke('{"a": 1}') == {"a": 1}
+assert JsonParser().invoke({"content": f"{fence}json\n[1, 2]\n{fence}"}) == [1, 2]
+try:
+    JsonParser().invoke("nope")
+    assert False
+except ValueError as e:
+    assert "could not parse JSON" in str(e)
+::: test parsers are runnables
+chain = RunnableLambda(lambda x: f"{x}, {x}!") | ListParser()
+assert chain.invoke("hey") == ["hey", "hey!"]
+
+=== lc-06 | Your first real chain: prompt | llm | parser | 3
+::: story
+Now compose the pieces. The `mini_lc` prelude provides `PromptTemplate`,
+`StrOutputParser`, `RunnableParallel`, `RunnablePassthrough`, and `|`
+support for any object with `.invoke` (like FakeLLM). This is EXACTLY how
+LangChain apps are written.
+::: setup fake_llm mini_lc
+::: task
+1. `make_summary_chain(llm)` -> chain taking `{"text": ..., "n": ...}` that
+   formats the prompt `"Summarize in {n} words: {text}"`, calls llm, and
+   parses to a stripped str.
+2. `make_analysis_chain(llm)` -> chain taking `{"text": ...}` that returns
+   `{"summary": ..., "sentiment": ...}` by running two chains in parallel:
+   - summary: `"Summarize in 10 words: {text}"`
+   - sentiment: `"Classify the sentiment of: {text}"`
+   Both parse with `StrOutputParser()`. (Reuse make_summary_chain! You will
+   need to add `n` to the input — `RunnablePassthrough.assign` or a lambda.)
+::: starter
+def make_summary_chain(llm):
+    pass
+
+def make_analysis_chain(llm):
+    pass
+::: solution
+def make_summary_chain(llm):
+    prompt = PromptTemplate.from_template("Summarize in {n} words: {text}")
+    return prompt | llm | StrOutputParser()
+
+def make_analysis_chain(llm):
+    sentiment = PromptTemplate.from_template("Classify the sentiment of: {text}") | llm | StrOutputParser()
+    summary = (lambda d: {**d, "n": 10}) | make_summary_chain(llm)
+    return RunnableParallel({"summary": summary, "sentiment": sentiment})
+::: hint
+`PromptTemplate.from_template(...) | llm | StrOutputParser()` — the pipe coerces the llm for you.
+::: hint
+For the parallel version, a lambda can add `n`: `(lambda d: {**d, "n": 10}) | make_summary_chain(llm)`.
+::: test summary chain
+llm = FakeLLM(responses=["  Agents call tools.  "])
+chain = make_summary_chain(llm)
+assert chain.invoke({"text": "long text about agents", "n": 3}) == "Agents call tools."
+assert llm.calls == ["Summarize in 3 words: long text about agents"]
+::: test analysis chain
+llm = FakeLLM(rules={"summarize": "short summary", "sentiment": "positive"})
+out = make_analysis_chain(llm).invoke({"text": "I love LangGraph"})
+assert out == {"summary": "short summary", "sentiment": "positive"}
+assert "Summarize in 10 words: I love LangGraph" in llm.calls
+::: realworld
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.output_parsers import StrOutputParser
+    chain = ChatPromptTemplate.from_template("Summarize: {text}") | llm | StrOutputParser()
+    chain.invoke({"text": doc})
+
+=== lc-07 | Build the @tool decorator | 4
+::: story
+To let a model call your function, you must describe it as a JSON schema:
+name, description, and typed parameters. LangChain's `@tool` reads all of
+that from the function signature and docstring using `inspect`:
+```
+import inspect
+sig = inspect.signature(fn)
+for p in sig.parameters.values():
+    p.name, p.annotation, p.default is inspect.Parameter.empty
+inspect.getdoc(fn)
+```
+::: task
+Write a decorator `tool` that turns a function into a `Tool` object with:
+- `name` (function name) and `description` (first line of the docstring;
+  raise `ValueError` at decoration time if there is no docstring)
+- `parameters`: dict name -> `{"type": <json type>, "required": bool}` with
+  types `str->"string"`, `int->"integer"`, `float->"number"`, `bool->"boolean"`,
+  `list->"array"`, `dict->"object"`, anything else `"string"`. Required =
+  no default value.
+- `invoke(args: dict)`: raise `ValueError` if a required arg is missing or an
+  unknown arg is passed; otherwise call the function with `**args`
+- `schema()`: `{"name", "description", "parameters": {"type": "object",
+  "properties": {name: {"type": ...}}, "required": [names in order]}}`
+- calling the Tool directly (`t(1, 2)`) still calls the original function.
+::: starter
+import inspect
+
+JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean", list: "array", dict: "object"}
+
+class Tool:
+    pass
+
+def tool(fn):
+    pass
+::: solution
+import inspect
+
+JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean", list: "array", dict: "object"}
+
+class Tool:
+    def __init__(self, fn):
+        doc = inspect.getdoc(fn)
+        if not doc:
+            raise ValueError(f"tool {fn.__name__!r} needs a docstring")
+        self.fn = fn
+        self.name = fn.__name__
+        self.description = doc.splitlines()[0]
+        self.parameters = {}
+        for p in inspect.signature(fn).parameters.values():
+            self.parameters[p.name] = {
+                "type": JSON_TYPES.get(p.annotation, "string"),
+                "required": p.default is inspect.Parameter.empty,
+            }
+
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
+
+    def invoke(self, args):
+        unknown = set(args) - set(self.parameters)
+        if unknown:
+            raise ValueError(f"unknown arguments: {sorted(unknown)}")
+        missing = [n for n, p in self.parameters.items() if p["required"] and n not in args]
+        if missing:
+            raise ValueError(f"missing arguments: {missing}")
+        return self.fn(**args)
+
+    def schema(self):
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": {
+                "type": "object",
+                "properties": {n: {"type": p["type"]} for n, p in self.parameters.items()},
+                "required": [n for n, p in self.parameters.items() if p["required"]],
+            },
+        }
+
+def tool(fn):
+    return Tool(fn)
+::: hint
+`JSON_TYPES.get(p.annotation, "string")` maps the annotation; unannotated params have `inspect.Parameter.empty` and fall back to "string".
+::: hint
+Compute unknown args with a set difference: `set(args) - set(self.parameters)`.
+::: test metadata
+@tool
+def search(query: str, limit: int = 5) -> list:
+    """Search the web.
+
+    Longer explanation here."""
+    return [query] * limit
+assert search.name == "search" and search.description == "Search the web."
+assert search.parameters == {"query": {"type": "string", "required": True}, "limit": {"type": "integer", "required": False}}
+::: test schema
+@tool
+def weather(city: str, celsius: bool = True):
+    """Get the weather."""
+    return city
+assert weather.schema() == {
+    "name": "weather",
+    "description": "Get the weather.",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "celsius": {"type": "boolean"}}, "required": ["city"]},
+}
+::: test invoke validates
+@tool
+def add(a: int, b: int) -> int:
+    """Add numbers."""
+    return a + b
+assert add.invoke({"a": 2, "b": 3}) == 5 and add(1, 2) == 3
+for bad in [{"a": 1}, {"a": 1, "b": 2, "c": 3}]:
+    try:
+        add.invoke(bad)
+        assert False, bad
+    except ValueError:
+        pass
+::: test docstring required
+try:
+    @tool
+    def nodoc(x): return x
+    assert False
+except ValueError:
+    pass
+::: realworld
+    from langchain_core.tools import tool
+    @tool
+    def search(query: str) -> str:
+        """Search the web."""
+    llm.bind_tools([search])
+
+=== lc-08 | The tool-calling loop | 4
+::: story
+How agents actually work:
+1. send messages to the model
+2. if the reply contains `tool_calls`, run each tool, append a `tool` message
+   with the result, and go back to 1
+3. otherwise the reply is the final answer
+The FakeLLM is scripted to return tool calls like:
+```
+{"content": "", "tool_calls": [{"id": "c1", "name": "add", "args": {"a": 2, "b": 3}}]}
+```
+`tool` from mini_lc gives objects with `.name` and `.invoke(args_dict)`.
+::: setup fake_llm mini_lc
+::: task
+Write `run_agent(llm, tools, question, max_steps=5)`:
+- start with `messages = [{"role": "user", "content": question}]`
+- each step: `reply = llm.invoke(messages)`
+  - if reply is a dict with non-empty `tool_calls`: append
+    `{"role": "assistant", "content": reply.get("content", ""), "tool_calls": reply["tool_calls"]}`,
+    then for each call append
+    `{"role": "tool", "tool_call_id": call["id"], "content": str(result)}`.
+    Unknown tool -> content `"Error: unknown tool <name>"`; a tool that raises
+    -> content `"Error: <exception message>"` (the agent can recover!)
+  - otherwise return the final answer text (reply itself if str, else its "content")
+- if `max_steps` model calls happen without a final answer, raise `RuntimeError`.
+Return value: `(answer, messages)` — messages includes the final assistant message.
+::: starter
+def run_agent(llm, tools, question, max_steps=5):
+    by_name = {t.name: t for t in tools}
+    messages = [{"role": "user", "content": question}]
+    pass
+::: solution
+def run_agent(llm, tools, question, max_steps=5):
+    by_name = {t.name: t for t in tools}
+    messages = [{"role": "user", "content": question}]
+    for _ in range(max_steps):
+        reply = llm.invoke(list(messages))
+        if isinstance(reply, dict) and reply.get("tool_calls"):
+            messages.append({"role": "assistant", "content": reply.get("content", ""), "tool_calls": reply["tool_calls"]})
+            for call in reply["tool_calls"]:
+                t = by_name.get(call["name"])
+                if t is None:
+                    result = f"Error: unknown tool {call['name']}"
+                else:
+                    try:
+                        result = t.invoke(call["args"])
+                    except Exception as exc:
+                        result = f"Error: {exc}"
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": str(result)})
+            continue
+        answer = reply if isinstance(reply, str) else reply.get("content", "")
+        messages.append({"role": "assistant", "content": answer})
+        return answer, messages
+    raise RuntimeError(f"no final answer after {max_steps} steps")
+::: hint
+Use a `for _ in range(max_steps)` loop; `continue` after handling tool calls, `return` on a final answer, `raise` after the loop.
+::: hint
+Wrap `t.invoke(call["args"])` in try/except so a broken tool becomes an error message instead of a crash.
+::: test single tool call
+@tool
+def add(a: int, b: int) -> int:
+    """Add two numbers."""
+    return a + b
+llm = FakeLLM(responses=[
+    {"content": "", "tool_calls": [{"id": "c1", "name": "add", "args": {"a": 2, "b": 3}}]},
+    "The answer is 5.",
+])
+answer, msgs = run_agent(llm, [add], "what is 2+3?")
+assert answer == "The answer is 5."
+assert [m["role"] for m in msgs] == ["user", "assistant", "tool", "assistant"]
+assert msgs[2] == {"role": "tool", "tool_call_id": "c1", "content": "5"}
+assert llm.calls[1][-1]["role"] == "tool", "send the tool result back to the model"
+::: test errors become messages
+@tool
+def div(a: float, b: float) -> float:
+    """Divide."""
+    return a / b
+llm = FakeLLM(responses=[
+    {"content": "", "tool_calls": [{"id": "x", "name": "nope", "args": {}}, {"id": "y", "name": "div", "args": {"a": 1, "b": 0}}]},
+    {"role": "assistant", "content": "Sorry, cannot divide by zero."},
+])
+answer, msgs = run_agent(llm, [div], "1/0?")
+assert msgs[2]["content"] == "Error: unknown tool nope"
+assert msgs[3]["content"] == "Error: division by zero"
+assert answer == "Sorry, cannot divide by zero."
+::: test max steps
+loop = {"content": "", "tool_calls": [{"id": "1", "name": "nope", "args": {}}]}
+llm = FakeLLM(responses=[loop] * 10)
+try:
+    run_agent(llm, [], "?", max_steps=3)
+    assert False
+except RuntimeError:
+    pass
+assert len(llm.calls) == 3
+
+=== lc-09 | Conversation memory per session | 3
+::: story
+A chatbot must remember earlier turns — per user! LangChain's
+`RunnableWithMessageHistory` keeps one history per `session_id` and sends a
+window of recent messages with each new question.
+::: setup fake_llm
+::: task
+Write `class SessionChat(llm, window=4, system=None)`:
+- `self.store`: dict session_id -> list of messages
+- `invoke(text, session_id="default")`:
+  - history = that session's messages (create an empty list if new)
+  - send to the llm: optional system message + the last `window` messages
+    of history + the new user message
+  - append BOTH the user message and the assistant reply to history
+  - return the reply
+- `history(session_id)` -> copy of that session's messages (`[]` if unknown)
+- `clear(session_id)` removes the session
+::: starter
+class SessionChat:
+    def __init__(self, llm, window=4, system=None):
+        self.llm = llm
+        self.window = window
+        self.system = system
+        self.store = {}
+::: solution
+class SessionChat:
+    def __init__(self, llm, window=4, system=None):
+        self.llm = llm
+        self.window = window
+        self.system = system
+        self.store = {}
+
+    def invoke(self, text, session_id="default"):
+        history = self.store.setdefault(session_id, [])
+        user_msg = {"role": "user", "content": text}
+        recent = history[-self.window:] if self.window > 0 else []
+        prompt = ([{"role": "system", "content": self.system}] if self.system else []) + recent + [user_msg]
+        reply = self.llm.invoke(prompt)
+        history.append(user_msg)
+        history.append({"role": "assistant", "content": reply})
+        return reply
+
+    def history(self, session_id):
+        return list(self.store.get(session_id, []))
+
+    def clear(self, session_id):
+        self.store.pop(session_id, None)
+::: hint
+`self.store.setdefault(session_id, [])` returns the existing list or inserts a new one.
+::: hint
+Watch out: `history[-0:]` is the whole list. Handle window=0 separately.
+::: test remembers within a session
+llm = FakeLLM(responses=["Nice to meet you, Ada", "Your name is Ada"])
+chat = SessionChat(llm)
+chat.invoke("my name is Ada", session_id="u1")
+assert chat.invoke("what's my name?", session_id="u1") == "Your name is Ada"
+sent = llm.calls[1]
+assert [m["content"] for m in sent] == ["my name is Ada", "Nice to meet you, Ada", "what's my name?"]
+::: test sessions are isolated
+llm = FakeLLM(default="ok")
+chat = SessionChat(llm, system="be kind")
+chat.invoke("secret", session_id="a")
+chat.invoke("hello", session_id="b")
+assert llm.calls[1] == [{"role": "system", "content": "be kind"}, {"role": "user", "content": "hello"}]
+assert len(chat.history("a")) == 2 and chat.history("zzz") == []
+::: test window
+llm = FakeLLM(default="r")
+chat = SessionChat(llm, window=2)
+for t in ["1", "2", "3"]:
+    chat.invoke(t)
+assert [m["content"] for m in llm.calls[-1]] == ["2", "r", "3"]
+chat.clear("default")
+assert chat.history("default") == []
+
+=== lc-10 | A full RAG chain | 4
+::: story
+Retrieval-Augmented Generation: fetch relevant docs, stuff them into the
+prompt, and let the model answer from them. In LCEL:
+```
+chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | prompt | llm | StrOutputParser()
+)
+```
+A `KeywordRetriever` (a Runnable: question -> list of doc dicts) is provided.
+::: setup fake_llm mini_lc
+class KeywordRetriever(Runnable):
+    """Returns docs sharing the most words with the query (top k)."""
+
+    def __init__(self, docs, k=2):
+        self.docs, self.k = docs, k
+
+    def invoke(self, query):
+        q = set(query.lower().split())
+        scored = [(len(q & set(d["text"].lower().split())), i, d) for i, d in enumerate(self.docs)]
+        scored = [s for s in scored if s[0] > 0]
+        scored.sort(key=lambda s: (-s[0], s[1]))
+        return [d for _, _, d in scored[: self.k]]
+
+RAG_PROMPT = PromptTemplate.from_template(
+    "Answer using only this context:\n{context}\n\nQuestion: {question}"
+)
+::: task
+1. `format_docs(docs)` -> one string, each doc as `"[<source>] <text>"`,
+   separated by newlines. No docs -> `"(no relevant documents)"`.
+2. `build_rag_chain(retriever, llm)` -> chain: question str -> answer str,
+   using `RAG_PROMPT`.
+3. `build_rag_with_sources(retriever, llm)` -> chain: question ->
+   `{"answer": str, "sources": [source, ...]}` (retrieve ONCE, then reuse the
+   docs for both the prompt and the source list).
+::: starter
+def format_docs(docs):
+    pass
+
+def build_rag_chain(retriever, llm):
+    pass
+
+def build_rag_with_sources(retriever, llm):
+    pass
+::: solution
+def format_docs(docs):
+    if not docs:
+        return "(no relevant documents)"
+    return "\n".join(f"[{d['source']}] {d['text']}" for d in docs)
+
+def build_rag_chain(retriever, llm):
+    return (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | RAG_PROMPT | llm | StrOutputParser()
+    )
+
+def build_rag_with_sources(retriever, llm):
+    answer = (
+        (lambda d: {"context": format_docs(d["docs"]), "question": d["question"]})
+        | RAG_PROMPT | llm | StrOutputParser()
+    )
+    return (
+        RunnableParallel({"docs": retriever, "question": RunnablePassthrough()})
+        | {"answer": answer, "sources": lambda d: [doc["source"] for doc in d["docs"]]}
+    )
+::: hint
+A dict at the start of a pipe runs both branches on the same input (the question).
+::: hint
+For sources: first produce `{"docs": ..., "question": ...}`, then a second parallel step computes answer and sources from that dict.
+::: hint
+Gotcha: `{...} | {...}` is Python's dict MERGE operator, not a pipe! Wrap the first dict in `RunnableParallel(...)` so the `|` becomes LCEL.
+::: test format docs
+assert format_docs([{"source": "a.md", "text": "hi"}, {"source": "b.md", "text": "yo"}]) == "[a.md] hi\n[b.md] yo"
+assert format_docs([]) == "(no relevant documents)"
+::: test rag chain
+docs = [
+    {"source": "lg.md", "text": "LangGraph builds stateful agent graphs"},
+    {"source": "cat.md", "text": "Cats sleep a lot"},
+    {"source": "lc.md", "text": "LangChain composes runnables into chains"},
+]
+llm = FakeLLM(responses=["LangGraph builds graphs."])
+chain = build_rag_chain(KeywordRetriever(docs, k=1), llm)
+assert chain.invoke("what does langgraph build") == "LangGraph builds graphs."
+prompt = llm.calls[0]
+assert "[lg.md] LangGraph builds stateful agent graphs" in prompt and "Question: what does langgraph build" in prompt
+assert "Cats" not in prompt
+::: test with sources retrieves once
+class CountingRetriever(KeywordRetriever):
+    n = 0
+    def invoke(self, q):
+        CountingRetriever.n += 1
+        return super().invoke(q)
+docs = [{"source": "x", "text": "agents use tools"}, {"source": "y", "text": "tools are functions"}]
+r = CountingRetriever(docs)
+out = build_rag_with_sources(r, FakeLLM(default=" ans ")).invoke("tools")
+assert out == {"answer": "ans", "sources": ["x", "y"]}
+assert CountingRetriever.n == 1, f"retriever ran {CountingRetriever.n} times"

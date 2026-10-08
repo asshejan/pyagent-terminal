@@ -1,0 +1,765 @@
+=== ai-01 | Chat messages | 1
+::: story
+Every modern chat API takes a list of messages with roles:
+- `system`: instructions for the model's behaviour
+- `user`: what the human said
+- `assistant`: what the model said
+- `tool`: results of tool calls
+Small helper functions keep this tidy (LangChain has `SystemMessage`, `HumanMessage`, ...).
+::: task
+1. `system(text)`, `user(text)`, `assistant(text)` each return
+   `{"role": <role>, "content": text}`.
+2. `format_chat(messages)` returns one string with a line per message:
+   `"SYSTEM: Be brief.\nUSER: Hi"` (role uppercased, joined with newlines).
+3. `last_user_message(messages)` returns the content of the most recent user
+   message, or `None`.
+::: starter
+def system(text):
+    pass
+
+def user(text):
+    pass
+
+def assistant(text):
+    pass
+
+def format_chat(messages):
+    pass
+
+def last_user_message(messages):
+    pass
+::: solution
+def _msg(role, text):
+    return {"role": role, "content": text}
+
+def system(text):
+    return _msg("system", text)
+
+def user(text):
+    return _msg("user", text)
+
+def assistant(text):
+    return _msg("assistant", text)
+
+def format_chat(messages):
+    return "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
+
+def last_user_message(messages):
+    for m in reversed(messages):
+        if m["role"] == "user":
+            return m["content"]
+    return None
+::: hint
+`"\n".join(...)` with a generator of f-strings builds the transcript.
+::: hint
+`for m in reversed(messages)` walks from newest to oldest.
+::: test builders
+assert user("hi") == {"role": "user", "content": "hi"}
+assert system("s")["role"] == "system" and assistant("a")["role"] == "assistant"
+::: test format
+assert format_chat([system("Be brief."), user("Hi")]) == "SYSTEM: Be brief.\nUSER: Hi"
+assert format_chat([]) == ""
+::: test last user
+msgs = [user("first"), assistant("ok"), user("second"), assistant("done")]
+assert last_user_message(msgs) == "second"
+assert last_user_message([system("x")]) is None
+
+=== ai-02 | Fitting history into the context window | 3
+::: story
+When a conversation grows past the model's limit you must drop messages.
+Rules most apps use:
+- system messages are always kept (they define behaviour)
+- drop the OLDEST non-system messages first
+- keep the original order
+::: task
+Write `trim_history(messages, max_tokens, count=None)`:
+- `count(message) -> int` defaults to the number of words in content
+- return a new list that keeps all system messages plus as many of the most
+  recent other messages as fit, so that the total count <= max_tokens
+- stop adding at the first (newest-to-oldest) message that does not fit
+- original order must be preserved
+- if system messages alone exceed the budget, return just the system messages
+::: starter
+def trim_history(messages, max_tokens, count=None):
+    if count is None:
+        count = lambda m: len(m["content"].split())
+    pass
+::: solution
+def trim_history(messages, max_tokens, count=None):
+    if count is None:
+        count = lambda m: len(m["content"].split())
+    systems = [m for m in messages if m["role"] == "system"]
+    budget = max_tokens - sum(count(m) for m in systems)
+    keep = set()
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if m["role"] == "system":
+            continue
+        cost = count(m)
+        if cost > budget:
+            break
+        budget -= cost
+        keep.add(i)
+    return [m for i, m in enumerate(messages) if m["role"] == "system" or i in keep]
+::: hint
+Start with the budget minus the cost of all system messages. Then walk the others from the end backwards.
+::: hint
+Remember the INDEXES you keep, then rebuild the list in original order with a comprehension.
+::: test keeps recent and system
+msgs = [
+    {"role": "system", "content": "be brief"},
+    {"role": "user", "content": "one two three"},
+    {"role": "assistant", "content": "four five"},
+    {"role": "user", "content": "six"},
+]
+out = trim_history(msgs, 5)
+assert out == [msgs[0], msgs[2], msgs[3]], out
+::: test everything fits
+msgs = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
+assert trim_history(msgs, 10) == msgs
+::: test system over budget
+msgs = [{"role": "system", "content": "a b c d"}, {"role": "user", "content": "x"}]
+assert trim_history(msgs, 2) == [msgs[0]]
+::: test custom counter
+msgs = [{"role": "user", "content": "aaaa"}, {"role": "user", "content": "bb"}]
+assert trim_history(msgs, 3, count=lambda m: len(m["content"])) == [msgs[1]]
+::: test stops at first that does not fit
+msgs = [{"role": "user", "content": "a"}, {"role": "user", "content": "b c d"}, {"role": "user", "content": "e"}]
+assert trim_history(msgs, 3) == [msgs[2]], "don't skip over a big message to keep older ones"
+
+=== ai-03 | Build your own PromptTemplate | 3
+::: story
+Prompt templates separate the fixed instructions from the variable parts.
+`string.Formatter().parse(template)` yields `(literal, field_name, spec, conv)`
+tuples — a reliable way to find `{variables}`:
+```
+import string
+[f for _, f, _, _ in string.Formatter().parse("Hi {name}, {x}") if f]
+# ['name', 'x']
+```
+::: task
+Write `class PromptTemplate(template, partial_vars=None)`:
+- `input_variables`: sorted list of variable names NOT already provided by
+  partial_vars
+- `format(**kwargs)`: fills everything (partial_vars + kwargs). If anything is
+  missing raise `KeyError` whose message contains the missing names.
+- `partial(**kwargs)`: returns a NEW PromptTemplate with those variables
+  pre-filled (the original is unchanged)
+- `PromptTemplate.from_template(t)` classmethod.
+::: starter
+import string
+
+class PromptTemplate:
+    def __init__(self, template, partial_vars=None):
+        self.template = template
+::: solution
+import string
+
+class PromptTemplate:
+    def __init__(self, template, partial_vars=None):
+        self.template = template
+        self.partial_vars = dict(partial_vars or {})
+        names = {f for _, f, _, _ in string.Formatter().parse(template) if f}
+        self.input_variables = sorted(names - set(self.partial_vars))
+
+    @classmethod
+    def from_template(cls, template):
+        return cls(template)
+
+    def format(self, **kwargs):
+        values = {**self.partial_vars, **kwargs}
+        missing = [v for v in self.input_variables if v not in values]
+        if missing:
+            raise KeyError(f"missing variables: {missing}")
+        return self.template.format(**values)
+
+    def partial(self, **kwargs):
+        return PromptTemplate(self.template, {**self.partial_vars, **kwargs})
+::: hint
+Use a set comprehension over `string.Formatter().parse(template)` and keep only truthy field names.
+::: hint
+`{**a, **b}` merges two dicts (b wins). `partial` returns `PromptTemplate(self.template, merged)`.
+::: test variables
+p = PromptTemplate.from_template("You are {role}. Answer {question} in {lang}.")
+assert p.input_variables == ["lang", "question", "role"]
+::: test format
+p = PromptTemplate("Hi {name}")
+assert p.format(name="Ada") == "Hi Ada"
+::: test missing raises
+try:
+    PromptTemplate("{a} {b}").format(a=1)
+    assert False
+except KeyError as e:
+    assert "b" in str(e)
+::: test partial
+base = PromptTemplate("{role}: {q}")
+expert = base.partial(role="Expert")
+assert expert.input_variables == ["q"] and base.input_variables == ["q", "role"]
+assert expert.format(q="why?") == "Expert: why?"
+::: realworld
+    from langchain_core.prompts import PromptTemplate
+    PromptTemplate.from_template("Tell me about {topic}").format(topic="RAG")
+
+=== ai-04 | Embeddings: cosine similarity | 2
+::: story
+An embedding turns text into a vector of numbers; similar meanings point in
+similar directions. Cosine similarity measures the angle:
+    cos(a, b) = (a . b) / (|a| * |b|)
+where a . b = sum(x*y) and |a| = sqrt(sum(x*x)). Result: 1 = same direction,
+0 = unrelated, -1 = opposite. No numpy needed!
+::: task
+1. `dot(a, b)` — raise `ValueError` if lengths differ
+2. `norm(a)` — Euclidean length
+3. `cosine(a, b)` — return 0.0 if either vector has zero length
+4. `most_similar(query, vectors)` — vectors is a dict name -> vector;
+   return the name with the highest cosine to query
+::: starter
+import math
+
+def dot(a, b):
+    pass
+
+def norm(a):
+    pass
+
+def cosine(a, b):
+    pass
+
+def most_similar(query, vectors):
+    pass
+::: solution
+import math
+
+def dot(a, b):
+    if len(a) != len(b):
+        raise ValueError("vectors must have the same length")
+    return sum(x * y for x, y in zip(a, b))
+
+def norm(a):
+    return math.sqrt(sum(x * x for x in a))
+
+def cosine(a, b):
+    na, nb = norm(a), norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot(a, b) / (na * nb)
+
+def most_similar(query, vectors):
+    return max(vectors, key=lambda name: cosine(query, vectors[name]))
+::: hint
+`zip(a, b)` pairs up elements: `sum(x * y for x, y in zip(a, b))`.
+::: hint
+`max(vectors, key=...)` iterates dict keys and picks the best one.
+::: test dot and norm
+assert dot([1, 2, 3], [4, 5, 6]) == 32
+assert norm([3, 4]) == 5.0
+::: test cosine
+assert abs(cosine([1, 0], [1, 0]) - 1) < 1e-9
+assert abs(cosine([1, 0], [0, 1])) < 1e-9
+assert abs(cosine([1, 1], [-1, -1]) + 1) < 1e-9
+assert cosine([0, 0], [1, 1]) == 0.0
+::: test length mismatch
+try:
+    dot([1], [1, 2])
+    assert False
+except ValueError:
+    pass
+::: test most similar
+vecs = {"cat": [1, 0.9, 0], "car": [0, 0.1, 1], "dog": [0.9, 1, 0.1]}
+assert most_similar([1, 1, 0], vecs) in ("cat", "dog")
+assert most_similar([0, 0, 1], vecs) == "car"
+
+=== ai-05 | Chunking documents with overlap | 3
+::: story
+Long documents are split into chunks before embedding. Overlap keeps context
+that would otherwise be cut at the boundary. With size=4, overlap=1:
+    "a b c d e f g"  ->  ["a b c d", "d e f g"]
+Each new chunk starts `size - overlap` words after the previous one.
+::: task
+Write `chunk_text(text, size, overlap=0)` splitting on words:
+- raise `ValueError` if size < 1, overlap < 0, or overlap >= size
+- chunks are space-joined words
+- stop once a chunk reaches the end of the text (no tiny trailing chunk that's
+  entirely inside the previous one)
+- empty text -> `[]`
+Then `chunk_documents(docs, size, overlap=0)` where docs are
+`{"id": ..., "text": ...}` returns a list of
+`{"doc_id": ..., "chunk": i, "text": ...}` (i counts from 0 per document).
+::: starter
+def chunk_text(text, size, overlap=0):
+    pass
+
+def chunk_documents(docs, size, overlap=0):
+    pass
+::: solution
+def chunk_text(text, size, overlap=0):
+    if size < 1 or overlap < 0 or overlap >= size:
+        raise ValueError("need size >= 1 and 0 <= overlap < size")
+    words = text.split()
+    chunks = []
+    step = size - overlap
+    start = 0
+    while start < len(words):
+        chunks.append(" ".join(words[start:start + size]))
+        if start + size >= len(words):
+            break
+        start += step
+    return chunks
+
+def chunk_documents(docs, size, overlap=0):
+    out = []
+    for doc in docs:
+        for i, chunk in enumerate(chunk_text(doc["text"], size, overlap)):
+            out.append({"doc_id": doc["id"], "chunk": i, "text": chunk})
+    return out
+::: hint
+`step = size - overlap`. Loop with a `start` index; after appending a chunk, `break` if `start + size >= len(words)`.
+::: hint
+`enumerate(...)` gives the chunk number for each document.
+::: test overlap
+assert chunk_text("a b c d e f g", 4, 1) == ["a b c d", "d e f g"]
+::: test no overlap
+assert chunk_text("a b c d e", 2) == ["a b", "c d", "e"]
+::: test no redundant tail
+assert chunk_text("a b c d", 3, 2) == ["a b c", "b c d"]
+::: test edge cases
+assert chunk_text("", 3) == [] and chunk_text("a b", 5) == ["a b"]
+for bad in [(0, 0), (3, 3), (3, -1)]:
+    try:
+        chunk_text("a b", *bad)
+        assert False, f"should reject {bad}"
+    except ValueError:
+        pass
+::: test documents
+docs = [{"id": "x", "text": "a b c"}, {"id": "y", "text": "d"}]
+assert chunk_documents(docs, 2) == [
+    {"doc_id": "x", "chunk": 0, "text": "a b"},
+    {"doc_id": "x", "chunk": 1, "text": "c"},
+    {"doc_id": "y", "chunk": 0, "text": "d"},
+]
+::: realworld
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50).split_text(doc)
+
+=== ai-06 | A tiny vector store | 3
+::: story
+A vector store keeps (text, embedding, metadata) and finds the nearest texts
+to a query. That's the "R" in RAG. The `embed` and `cosine` functions are
+provided (a toy bag-of-words embedding).
+::: setup
+import math
+
+VOCAB = ["python", "agent", "graph", "cat", "dog", "pet", "llm", "tool"]
+
+def embed(text):
+    words = text.lower().replace(",", " ").replace(".", " ").split()
+    return [float(words.count(v)) for v in VOCAB]
+
+def cosine(a, b):
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if not na or not nb:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+::: task
+Write `class VectorStore(embed_fn)`:
+- `add(texts, metadatas=None)`: embed and store each text (metadata defaults
+  to `{}`); returns the list of new integer ids (0, 1, 2, ... across calls)
+- `search(query, k=3, filter=None)`: returns up to k dicts
+  `{"id", "text", "score", "metadata"}` sorted by cosine score descending
+  (ties: lower id first). `filter` is an optional dict; only items whose
+  metadata contains all those key/value pairs are considered.
+- `len(store)` -> number of items
+::: starter
+class VectorStore:
+    def __init__(self, embed_fn):
+        self.embed_fn = embed_fn
+::: solution
+class VectorStore:
+    def __init__(self, embed_fn):
+        self.embed_fn = embed_fn
+        self.items = []
+
+    def add(self, texts, metadatas=None):
+        metadatas = metadatas or [{} for _ in texts]
+        ids = []
+        for text, meta in zip(texts, metadatas):
+            item_id = len(self.items)
+            self.items.append({"id": item_id, "text": text, "vector": self.embed_fn(text), "metadata": meta})
+            ids.append(item_id)
+        return ids
+
+    def __len__(self):
+        return len(self.items)
+
+    def search(self, query, k=3, filter=None):
+        qv = self.embed_fn(query)
+        hits = []
+        for item in self.items:
+            if filter and any(item["metadata"].get(key) != val for key, val in filter.items()):
+                continue
+            hits.append({"id": item["id"], "text": item["text"],
+                         "score": cosine(qv, item["vector"]), "metadata": item["metadata"]})
+        hits.sort(key=lambda h: (-h["score"], h["id"]))
+        return hits[:k]
+::: hint
+Store dicts with id, text, vector and metadata in a list.
+::: hint
+Sort hits with `key=lambda h: (-h["score"], h["id"])`, then slice `[:k]`.
+::: test add and len
+s = VectorStore(embed)
+assert s.add(["python agent", "cat dog"]) == [0, 1]
+assert s.add(["llm tool"]) == [2] and len(s) == 3
+::: test search ranks
+s = VectorStore(embed)
+s.add(["my cat is a pet", "python agent graph", "dog pet"])
+top = s.search("pet cat", k=2)
+assert [h["text"] for h in top] == ["my cat is a pet", "dog pet"]
+assert set(top[0]) == {"id", "text", "score", "metadata"}
+assert top[0]["score"] >= top[1]["score"]
+::: test filter by metadata
+s = VectorStore(embed)
+s.add(["python agent", "python graph"], [{"src": "a"}, {"src": "b"}])
+assert [h["text"] for h in s.search("python", filter={"src": "b"})] == ["python graph"]
+::: test ties by id
+s = VectorStore(embed)
+s.add(["tool", "tool"])
+assert [h["id"] for h in s.search("tool")] == [0, 1]
+
+=== ai-07 | Extracting JSON from chatty LLM output | 3
+::: story
+You asked for JSON. The model replied:
+    Sure! Here is the data: {"name": "Ada", "tags": ["x", "{y}"]} Hope that helps!
+You need a parser that finds the JSON object even when wrapped in text or a
+fenced code block — and that handles braces inside strings.
+::: task
+Write `extract_json(text)`:
+1. If the text contains a fenced block (three backticks, optional `json`),
+   parse the block's content.
+2. Otherwise find the first `{` and scan forward counting `{` and `}` to find
+   the matching close brace — but IGNORE braces inside JSON strings (track
+   whether you're inside quotes, and skip characters escaped by a backslash).
+3. Return the parsed dict. Raise `ValueError` if nothing parseable is found.
+::: starter
+import json
+import re
+
+def extract_json(text):
+    pass
+::: solution
+import json
+import re
+
+def extract_json(text):
+    fenced = re.search(r"`{3}(?:json)?\s*(.*?)`{3}", text, re.S)
+    if fenced:
+        return json.loads(fenced.group(1))
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("no JSON object found")
+    depth, in_str, escaped = 0, False, False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:i + 1])
+    raise ValueError("unbalanced braces")
+::: hint
+Keep three variables while scanning: `depth`, `in_str`, `escaped`.
+::: hint
+When depth returns to 0, `json.loads(text[start:i + 1])`.
+::: test plain wrapped
+t = 'Sure! Here: {"name": "Ada", "n": 1} Hope that helps!'
+assert extract_json(t) == {"name": "Ada", "n": 1}
+::: test braces inside strings
+t = 'ok {"a": "}{", "b": {"c": 2}} trailing }'
+assert extract_json(t) == {"a": "}{", "b": {"c": 2}}
+::: test escaped quotes
+t = r'x {"q": "say \"hi}\""} y'
+assert extract_json(t) == {"q": 'say "hi}"'}
+::: test fenced
+fence = "`" * 3
+assert extract_json(f"text\n{fence}json\n{{\"k\": [1, 2]}}\n{fence}") == {"k": [1, 2]}
+::: test errors
+for bad in ["no json", "{ unclosed"]:
+    try:
+        extract_json(bad)
+        assert False, bad
+    except ValueError:
+        pass
+
+=== ai-08 | Structured output with Pydantic | 3
+::: story
+Pydantic validates data against a typed model — the standard way to get
+structured output from LLMs (`llm.with_structured_output(Model)`).
+```
+from pydantic import BaseModel, Field
+class User(BaseModel):
+    name: str = Field(min_length=1)
+    age: int = 0
+User.model_validate_json('{"name": "Ada", "age": 36}')
+```
+Invalid data raises `ValidationError` (a subclass of ValueError).
+::: task
+1. `class Ticket(BaseModel)`:
+   - `title: str` with at least 3 characters
+   - `priority: Literal["low", "medium", "high"]`
+   - `tags: list[str]` defaulting to an empty list
+   - a `field_validator("priority", mode="before")` that lowercases and strips
+     strings, so `" HIGH "` is accepted
+2. `parse_ticket(text)` -> Ticket from a JSON string (raises on invalid).
+3. `ticket_schema_fields()` -> sorted list of field names from
+   `Ticket.model_json_schema()["properties"]`.
+::: starter
+from typing import Literal
+from pydantic import BaseModel, Field, field_validator
+
+class Ticket(BaseModel):
+    pass
+
+def parse_ticket(text):
+    pass
+
+def ticket_schema_fields():
+    pass
+::: solution
+from typing import Literal
+from pydantic import BaseModel, Field, field_validator
+
+class Ticket(BaseModel):
+    title: str = Field(min_length=3)
+    priority: Literal["low", "medium", "high"]
+    tags: list[str] = Field(default_factory=list)
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def normalise_priority(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
+
+def parse_ticket(text):
+    return Ticket.model_validate_json(text)
+
+def ticket_schema_fields():
+    return sorted(Ticket.model_json_schema()["properties"])
+::: hint
+Validators are classmethods: stack `@field_validator(...)` on top of `@classmethod`.
+::: hint
+`Ticket.model_validate_json(text)` parses and validates in one step.
+::: test valid ticket
+t = parse_ticket('{"title": "Login broken", "priority": " HIGH ", "tags": ["auth"]}')
+assert (t.title, t.priority, t.tags) == ("Login broken", "high", ["auth"])
+assert parse_ticket('{"title": "abc", "priority": "low"}').tags == []
+::: test invalid tickets
+for bad in ['{"title": "ab", "priority": "low"}', '{"title": "abcd", "priority": "urgent"}', '{"priority": "low"}']:
+    try:
+        parse_ticket(bad)
+        assert False, f"accepted {bad}"
+    except ValueError:
+        pass
+::: test schema
+assert ticket_schema_fields() == ["priority", "tags", "title"]
+
+=== ai-09 | Async: calling models in parallel | 4
+::: story
+Network calls spend most of their time WAITING. `async`/`await` lets one
+thread wait on many calls at once:
+```
+import asyncio
+async def fetch(x):
+    await asyncio.sleep(0.1)
+    return x
+results = await asyncio.gather(fetch(1), fetch(2))   # [1, 2], ~0.1s total
+await asyncio.wait_for(fetch(3), timeout=1.0)       # TimeoutError if too slow
+```
+(Here, tests `await` your functions directly — in a script you'd use `asyncio.run(main())`.)
+::: setup
+import asyncio
+
+ACTIVE = {"now": 0, "peak": 0}
+
+async def call_model(prompt, delay=0.01):
+    """Fake async LLM call that tracks how many run concurrently."""
+    ACTIVE["now"] += 1
+    ACTIVE["peak"] = max(ACTIVE["peak"], ACTIVE["now"])
+    try:
+        await asyncio.sleep(delay)
+        if "fail" in prompt:
+            raise RuntimeError(f"model failed on {prompt!r}")
+        return prompt.upper()
+    finally:
+        ACTIVE["now"] -= 1
+::: task
+`call_model(prompt, delay)` is provided (async; raises on prompts containing "fail").
+1. `async def ask_all(prompts)`: run all calls CONCURRENTLY, return results in
+   the same order as prompts.
+2. `async def ask_with_timeout(prompt, delay, timeout, default="TIMEOUT")`:
+   return the result, or `default` if it takes longer than timeout.
+3. `async def ask_all_safe(prompts)`: like ask_all, but a failing call puts
+   `"ERROR: <message>"` in its slot instead of crashing everything
+   (hint: `gather(..., return_exceptions=True)`).
+::: starter
+import asyncio
+
+async def ask_all(prompts):
+    pass
+
+async def ask_with_timeout(prompt, delay, timeout, default="TIMEOUT"):
+    pass
+
+async def ask_all_safe(prompts):
+    pass
+::: solution
+import asyncio
+
+async def ask_all(prompts):
+    return list(await asyncio.gather(*(call_model(p) for p in prompts)))
+
+async def ask_with_timeout(prompt, delay, timeout, default="TIMEOUT"):
+    try:
+        return await asyncio.wait_for(call_model(prompt, delay), timeout)
+    except asyncio.TimeoutError:
+        return default
+
+async def ask_all_safe(prompts):
+    results = await asyncio.gather(*(call_model(p) for p in prompts), return_exceptions=True)
+    return [f"ERROR: {r}" if isinstance(r, Exception) else r for r in results]
+::: hint
+`asyncio.gather(*coroutines)` — note the star to unpack a generator of coroutines.
+::: hint
+`asyncio.wait_for` raises `asyncio.TimeoutError` on timeout; catch it and return the default.
+::: test runs concurrently in order
+ACTIVE["peak"] = 0
+out = await ask_all(["a", "b", "c"])
+assert out == ["A", "B", "C"]
+assert ACTIVE["peak"] == 3, f"only {ACTIVE['peak']} ran at once - use asyncio.gather"
+::: test timeout
+assert await ask_with_timeout("x", delay=0.0, timeout=1) == "X"
+assert await ask_with_timeout("x", delay=0.5, timeout=0.01) == "TIMEOUT"
+assert await ask_with_timeout("x", 0.5, 0.01, default=None) is None
+::: test safe gather
+out = await ask_all_safe(["ok", "please fail", "fine"])
+assert out == ["OK", "ERROR: model failed on 'please fail'", "FINE"], out
+
+=== ai-10 | Rate limits: backoff & token buckets | 4
+::: story
+Production LLM code must survive HTTP 429 "rate limited" errors.
+- Exponential backoff: wait base, base*2, base*4, ... (capped) between retries.
+- A token bucket limits YOUR request rate: it holds up to `capacity` tokens,
+  refills at `rate` tokens/second, and each request spends a token.
+To keep tests instant and deterministic, time is INJECTED: you receive a
+`sleep` function and a `clock` function instead of using `time` directly.
+::: setup
+class RateLimitError(Exception):
+    pass
+::: task
+1. `backoff_delays(retries, base=1.0, factor=2.0, max_delay=30.0)` -> list of
+   the `retries` delays, e.g. `(4, base=1)` -> `[1.0, 2.0, 4.0, 8.0]`, capped at max_delay.
+2. `call_with_backoff(fn, retries=3, base=1.0, sleep=None)`: call `fn()`; on
+   `RateLimitError` sleep the next backoff delay and retry; after `retries`
+   retries re-raise. Other exceptions propagate immediately.
+   (`sleep` defaults to `time.sleep`.)
+3. `class TokenBucket(capacity, rate, clock)`: starts full. `try_acquire(n=1)`
+   refills based on elapsed `clock()` time (never above capacity), then spends n
+   tokens and returns True, or returns False if not enough.
+::: starter
+import time
+
+def backoff_delays(retries, base=1.0, factor=2.0, max_delay=30.0):
+    pass
+
+def call_with_backoff(fn, retries=3, base=1.0, sleep=None):
+    pass
+
+class TokenBucket:
+    def __init__(self, capacity, rate, clock):
+        pass
+::: solution
+import time
+
+def backoff_delays(retries, base=1.0, factor=2.0, max_delay=30.0):
+    return [min(max_delay, base * factor ** i) for i in range(retries)]
+
+def call_with_backoff(fn, retries=3, base=1.0, sleep=None):
+    sleep = sleep or time.sleep
+    delays = backoff_delays(retries, base)
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except RateLimitError:
+            if attempt == retries:
+                raise
+            sleep(delays[attempt])
+
+class TokenBucket:
+    def __init__(self, capacity, rate, clock):
+        self.capacity = capacity
+        self.rate = rate
+        self.clock = clock
+        self.tokens = float(capacity)
+        self.last = clock()
+
+    def try_acquire(self, n=1):
+        now = self.clock()
+        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+        self.last = now
+        if self.tokens >= n:
+            self.tokens -= n
+            return True
+        return False
+::: hint
+Delay i is `min(max_delay, base * factor ** i)`.
+::: hint
+TokenBucket: on each call add `(now - last) * rate` tokens, cap at capacity, update `last`.
+::: test delays
+assert backoff_delays(4) == [1.0, 2.0, 4.0, 8.0]
+assert backoff_delays(3, base=10, max_delay=25) == [10, 20, 25]
+::: test backoff retries then succeeds
+slept, calls = [], []
+def flaky():
+    calls.append(1)
+    if len(calls) < 3:
+        raise RateLimitError("429")
+    return "ok"
+assert call_with_backoff(flaky, retries=3, base=0.5, sleep=slept.append) == "ok"
+assert slept == [0.5, 1.0]
+::: test backoff gives up
+slept = []
+def always():
+    raise RateLimitError("429")
+try:
+    call_with_backoff(always, retries=2, sleep=slept.append)
+    assert False
+except RateLimitError:
+    pass
+assert slept == [1.0, 2.0]
+::: test other errors not retried
+slept = []
+def boom():
+    raise KeyError("x")
+try:
+    call_with_backoff(boom, sleep=slept.append)
+except KeyError:
+    pass
+assert slept == []
+::: test token bucket
+now = [0.0]
+b = TokenBucket(capacity=2, rate=1.0, clock=lambda: now[0])
+assert b.try_acquire() and b.try_acquire() and not b.try_acquire()
+now[0] = 0.5
+assert not b.try_acquire()
+now[0] = 1.0
+assert b.try_acquire()
+now[0] = 100.0
+assert b.try_acquire(2) and not b.try_acquire(), "bucket must cap at capacity"

@@ -1,0 +1,915 @@
+=== oop-01 | Your first class: an Agent | 1
+::: story
+A class bundles DATA (attributes) with BEHAVIOUR (methods). `__init__` runs
+when you create an instance; `self` is that instance.
+```
+class Dog:
+    def __init__(self, name):
+        self.name = name
+        self.tricks = []
+    def learn(self, trick):
+        self.tricks.append(trick)
+rex = Dog("Rex"); rex.learn("sit")
+```
+::: task
+Write `class Agent`:
+- `Agent(name, model="mini")` stores `name`, `model` and an empty `history` list
+- `remember(text)` appends text to history and returns the new history length
+- `last()` returns the most recent text, or `None` if history is empty
+- `reset()` empties the history
+::: starter
+class Agent:
+    def __init__(self, name, model="mini"):
+        pass
+::: solution
+class Agent:
+    def __init__(self, name, model="mini"):
+        self.name = name
+        self.model = model
+        self.history = []
+
+    def remember(self, text):
+        self.history.append(text)
+        return len(self.history)
+
+    def last(self):
+        return self.history[-1] if self.history else None
+
+    def reset(self):
+        self.history.clear()
+::: hint
+Every method's first parameter is `self`. Store data with `self.history = []`.
+::: hint
+`self.history[-1] if self.history else None`
+::: test attributes
+a = Agent("scout")
+assert (a.name, a.model, a.history) == ("scout", "mini", [])
+assert Agent("x", model="big").model == "big"
+::: test remember and last
+a = Agent("a")
+assert a.last() is None
+assert a.remember("hi") == 1 and a.remember("yo") == 2
+assert a.last() == "yo"
+::: test instances don't share history
+a, b = Agent("a"), Agent("b")
+a.remember("secret")
+assert b.history == []
+::: test reset
+a = Agent("a"); a.remember("x"); a.reset()
+assert a.history == [] and a.last() is None
+
+=== oop-02 | Class vs instance attributes | 2
+::: story
+Attributes defined in the class body are shared by ALL instances. Attributes
+set on `self` belong to one instance and shadow the class one.
+```
+class Config:
+    retries = 3            # class attribute (shared default)
+c = Config(); c.retries = 5   # instance attribute, only for c
+Config.retries                # still 3
+```
+::: task
+Write `class APIClient`:
+- class attribute `base_url = "https://api.example.com"`
+- class attribute `created = 0` — count of clients ever created (increment
+  `APIClient.created` in `__init__`, NOT `self.created`)
+- `APIClient(api_key, base_url=None)`: stores `api_key`; if a base_url is
+  given, store it on the instance so it overrides the class default
+- `url(path)` returns `base_url + "/" + path` without double slashes
+  (`path` may start with "/")
+::: starter
+class APIClient:
+    def __init__(self, api_key, base_url=None):
+        pass
+::: solution
+class APIClient:
+    base_url = "https://api.example.com"
+    created = 0
+
+    def __init__(self, api_key, base_url=None):
+        self.api_key = api_key
+        if base_url is not None:
+            self.base_url = base_url
+        APIClient.created += 1
+
+    def url(self, path):
+        return self.base_url.rstrip("/") + "/" + path.lstrip("/")
+::: hint
+`self.created += 1` would create an INSTANCE attribute. Use `APIClient.created += 1`.
+::: hint
+Only assign `self.base_url` when one was passed; otherwise `self.base_url` falls back to the class attribute.
+::: test class defaults
+APIClient.created = 0
+c = APIClient("k")
+assert c.base_url == "https://api.example.com" and c.api_key == "k"
+assert "base_url" not in vars(c), "don't copy the default onto the instance"
+::: test override
+c = APIClient("k", base_url="http://localhost:8000")
+assert c.base_url == "http://localhost:8000"
+assert APIClient.base_url == "https://api.example.com"
+::: test counts instances on the class
+APIClient.created = 0
+APIClient("a"); APIClient("b")
+assert APIClient.created == 2
+::: test url joining
+c = APIClient("k")
+assert c.url("v1/chat") == "https://api.example.com/v1/chat"
+assert c.url("/v1/chat") == "https://api.example.com/v1/chat"
+
+=== oop-03 | Properties: computed & validated attributes | 2
+::: story
+`@property` makes a method look like an attribute. Add a `.setter` to
+validate assignments:
+```
+class Temp:
+    def __init__(self): self._c = 0
+    @property
+    def celsius(self): return self._c
+    @celsius.setter
+    def celsius(self, v):
+        if v < -273: raise ValueError("too cold")
+        self._c = v
+```
+::: task
+Write `class Conversation`:
+- `Conversation(temperature=0.7)`; has a `messages` list of strings
+- `add(text)` appends a message
+- read-only property `token_count`: total words across all messages
+- property `temperature` with a setter that raises `ValueError` unless
+  `0 <= value <= 2`. The constructor must use the same validation.
+::: starter
+class Conversation:
+    def __init__(self, temperature=0.7):
+        self.messages = []
+::: solution
+class Conversation:
+    def __init__(self, temperature=0.7):
+        self.messages = []
+        self.temperature = temperature
+
+    def add(self, text):
+        self.messages.append(text)
+
+    @property
+    def token_count(self):
+        return sum(len(m.split()) for m in self.messages)
+
+    @property
+    def temperature(self):
+        return self._temperature
+
+    @temperature.setter
+    def temperature(self, value):
+        if not 0 <= value <= 2:
+            raise ValueError("temperature must be between 0 and 2")
+        self._temperature = value
+::: hint
+Store the real value in `self._temperature`; the property reads/writes it.
+::: hint
+In `__init__`, write `self.temperature = temperature` so the setter validates it.
+::: test token count
+c = Conversation()
+c.add("hello world"); c.add("bye")
+assert c.token_count == 3
+::: test token_count is read-only
+try:
+    Conversation().token_count = 5
+    assert False, "token_count should not be settable"
+except AttributeError:
+    pass
+::: test temperature validation
+c = Conversation()
+c.temperature = 1.5
+assert c.temperature == 1.5
+for bad in (-0.1, 2.5):
+    try:
+        c.temperature = bad
+        assert False, f"{bad} accepted"
+    except ValueError:
+        pass
+::: test constructor validates
+try:
+    Conversation(temperature=9)
+    assert False
+except ValueError:
+    pass
+
+=== oop-04 | Inheritance and super() | 2
+::: story
+A subclass inherits everything from its parent and can extend it.
+`super()` calls the parent's version of a method:
+```
+class Animal:
+    def __init__(self, name): self.name = name
+    def speak(self): return "..."
+class Cat(Animal):
+    def __init__(self, name, indoor):
+        super().__init__(name)
+        self.indoor = indoor
+    def speak(self): return super().speak() + " meow"
+```
+::: task
+1. `class BaseAgent(name)`: stores `name`; `describe()` returns
+   `"<name>: a generic agent"`; `tools()` returns `[]`.
+2. `class ResearchAgent(BaseAgent)`: `ResearchAgent(name, sources)` calls
+   `super().__init__`, stores `sources` (list). `describe()` returns the
+   parent's description + `" with N sources"`. `tools()` returns the parent's
+   tools + `["search", "read"]`.
+::: starter
+class BaseAgent:
+    pass
+
+class ResearchAgent(BaseAgent):
+    pass
+::: solution
+class BaseAgent:
+    def __init__(self, name):
+        self.name = name
+
+    def describe(self):
+        return f"{self.name}: a generic agent"
+
+    def tools(self):
+        return []
+
+class ResearchAgent(BaseAgent):
+    def __init__(self, name, sources):
+        super().__init__(name)
+        self.sources = sources
+
+    def describe(self):
+        return super().describe() + f" with {len(self.sources)} sources"
+
+    def tools(self):
+        return super().tools() + ["search", "read"]
+::: hint
+In ResearchAgent.__init__: `super().__init__(name)` then `self.sources = sources`.
+::: hint
+`super().describe() + f" with {len(self.sources)} sources"`
+::: test base agent
+assert BaseAgent("bob").describe() == "bob: a generic agent"
+assert BaseAgent("bob").tools() == []
+::: test research agent
+r = ResearchAgent("ivy", ["a", "b"])
+assert r.name == "ivy" and isinstance(r, BaseAgent)
+assert r.describe() == "ivy: a generic agent with 2 sources"
+assert r.tools() == ["search", "read"]
+::: test uses super (not copy-paste)
+BaseAgent.tools = lambda self: ["think"]
+assert ResearchAgent("x", []).tools() == ["think", "search", "read"], "call super().tools()"
+
+=== oop-05 | Polymorphism: swappable models | 2
+::: story
+Polymorphism: different classes, same method name — calling code doesn't
+care which one it gets. That's why you can swap OpenAI for Anthropic in one
+line in LangChain: every chat model has `.invoke()`.
+`NotImplementedError` marks a method subclasses must override.
+::: task
+1. `class BaseModel`: `generate(prompt)` raises `NotImplementedError`;
+   `__call__(prompt)` returns `self.generate(prompt)`; `name` property
+   returns the class name (hint: `type(self).__name__`).
+2. Subclasses `EchoModel` (returns prompt), `UpperModel` (uppercase),
+   `ReverseModel` (reversed string) — each overrides ONLY `generate`.
+3. `compare(models, prompt)` -> dict of model.name -> output.
+::: starter
+class BaseModel:
+    def generate(self, prompt):
+        raise NotImplementedError
+
+def compare(models, prompt):
+    pass
+::: solution
+class BaseModel:
+    def generate(self, prompt):
+        raise NotImplementedError
+
+    def __call__(self, prompt):
+        return self.generate(prompt)
+
+    @property
+    def name(self):
+        return type(self).__name__
+
+class EchoModel(BaseModel):
+    def generate(self, prompt):
+        return prompt
+
+class UpperModel(BaseModel):
+    def generate(self, prompt):
+        return prompt.upper()
+
+class ReverseModel(BaseModel):
+    def generate(self, prompt):
+        return prompt[::-1]
+
+def compare(models, prompt):
+    return {m.name: m(prompt) for m in models}
+::: hint
+`prompt[::-1]` reverses a string.
+::: hint
+`compare` is a dict comprehension: `{m.name: m(prompt) for m in models}`
+::: test base raises
+try:
+    BaseModel().generate("x")
+    assert False
+except NotImplementedError:
+    pass
+::: test subclasses
+assert UpperModel()("hi") == "HI" and ReverseModel()("abc") == "cba" and EchoModel()("x") == "x"
+assert issubclass(EchoModel, BaseModel) and issubclass(ReverseModel, BaseModel)
+::: test compare
+out = compare([EchoModel(), UpperModel()], "ok")
+assert out == {"EchoModel": "ok", "UpperModel": "OK"}
+::: test subclasses only override generate
+for cls in (EchoModel, UpperModel, ReverseModel):
+    assert "__call__" not in vars(cls), f"{cls.__name__} should inherit __call__"
+
+=== oop-06 | Abstract base classes: BaseTool | 3
+::: story
+An ABC enforces a contract: you cannot instantiate a class until every
+`@abstractmethod` is implemented. Agent frameworks define tools this way.
+```
+from abc import ABC, abstractmethod
+class Shape(ABC):
+    @abstractmethod
+    def area(self): ...
+Shape()   # TypeError: Can't instantiate abstract class
+```
+::: task
+1. `class BaseTool(ABC)` with class attributes `name = "base"` and
+   `description = ""`, abstract method `run(self, query: str) -> str`, and a
+   concrete `__call__(self, query)` that raises `TypeError` if query isn't a
+   str, otherwise returns `self.run(query.strip())`.
+2. `class Calculator(BaseTool)`, name `"calculator"`: `run("3 * 4")` handles
+   `a <op> b` with ops `+ - * /` on numbers and returns the result as a string
+   (`"12"`, `"2.5"`; whole floats like `4.0` -> `"4"`). Don't use `eval`!
+3. `class WordCount(BaseTool)`, name `"word_count"`: returns the number of
+   words as a string.
+::: starter
+from abc import ABC, abstractmethod
+import operator
+
+class BaseTool(ABC):
+    name = "base"
+    description = ""
+::: solution
+from abc import ABC, abstractmethod
+import operator
+
+class BaseTool(ABC):
+    name = "base"
+    description = ""
+
+    @abstractmethod
+    def run(self, query: str) -> str:
+        ...
+
+    def __call__(self, query):
+        if not isinstance(query, str):
+            raise TypeError("tool input must be a string")
+        return self.run(query.strip())
+
+OPS = {"+": operator.add, "-": operator.sub, "*": operator.mul, "/": operator.truediv}
+
+class Calculator(BaseTool):
+    name = "calculator"
+    description = "Do arithmetic like '3 * 4'."
+
+    def run(self, query):
+        a, op, b = query.split()
+        result = OPS[op](float(a), float(b))
+        return str(int(result)) if result == int(result) else str(result)
+
+class WordCount(BaseTool):
+    name = "word_count"
+    description = "Count words."
+
+    def run(self, query):
+        return str(len(query.split()))
+::: hint
+`a, op, b = query.split()` then look the operator up in a dict like `{"+": operator.add, ...}`.
+::: hint
+`str(int(r)) if r == int(r) else str(r)` formats 4.0 as "4".
+::: test abstract
+try:
+    BaseTool()
+    assert False, "BaseTool must be abstract"
+except TypeError:
+    pass
+class Half(BaseTool):
+    pass
+try:
+    Half()
+    assert False, "subclass without run() must fail"
+except TypeError:
+    pass
+::: test calculator
+c = Calculator()
+assert c.name == "calculator"
+assert c("3 * 4") == "12" and c(" 5 / 2 ") == "2.5" and c("10 - 7") == "3"
+::: test word count
+assert WordCount()("the quick fox") == "3" and WordCount.name == "word_count"
+::: test type check
+try:
+    Calculator()(42)
+    assert False
+except TypeError:
+    pass
+
+=== oop-07 | Dunder methods: a Prompt type | 3
+::: story
+"Dunder" (double underscore) methods let your objects work with Python syntax:
+`__repr__` (debug view), `__str__` (print), `__len__` (len()), `__eq__` (==),
+`__add__` (+), `__contains__` (in). LangChain's prompt classes rely on these.
+::: task
+Write `class Prompt(text)`:
+- `repr(p)` -> `Prompt('the text')` (hint: `{self.text!r}`)
+- `str(p)` -> the text
+- `len(p)` -> number of words
+- `p1 == p2` when texts are equal; comparing to a non-Prompt returns `NotImplemented`
+- `p + other` -> new Prompt joining texts with a newline; `other` may be a
+  Prompt or a str. Also support `"str" + prompt` via `__radd__`.
+- `"word" in p` -> True if word appears (case-insensitive) as a word
+::: starter
+class Prompt:
+    def __init__(self, text):
+        self.text = text
+::: solution
+class Prompt:
+    def __init__(self, text):
+        self.text = text
+
+    def __repr__(self):
+        return f"Prompt({self.text!r})"
+
+    def __str__(self):
+        return self.text
+
+    def __len__(self):
+        return len(self.text.split())
+
+    def __eq__(self, other):
+        if not isinstance(other, Prompt):
+            return NotImplemented
+        return self.text == other.text
+
+    def __add__(self, other):
+        if isinstance(other, Prompt):
+            other = other.text
+        if not isinstance(other, str):
+            return NotImplemented
+        return Prompt(self.text + "\n" + other)
+
+    def __radd__(self, other):
+        if not isinstance(other, str):
+            return NotImplemented
+        return Prompt(other + "\n" + self.text)
+
+    def __contains__(self, word):
+        return word.lower() in self.text.lower().split()
+::: hint
+`__radd__` is called for `"str" + prompt` when str's own `__add__` gives up.
+::: hint
+For `in`, compare against `self.text.lower().split()`.
+::: test repr and str
+p = Prompt("be brief")
+assert repr(p) == "Prompt('be brief')" and str(p) == "be brief"
+::: test len and eq
+assert len(Prompt("a b c")) == 3
+assert Prompt("x") == Prompt("x") and Prompt("x") != Prompt("y")
+assert Prompt("x") != "x"
+::: test add
+assert (Prompt("a") + Prompt("b")).text == "a\nb"
+assert (Prompt("a") + "b").text == "a\nb"
+assert ("a" + Prompt("b")).text == "a\nb"
+assert isinstance(Prompt("a") + "b", Prompt)
+::: test contains
+p = Prompt("You are a Helpful assistant")
+assert "helpful" in p and "help" not in p
+
+=== oop-08 | Containers & __call__: a tool registry | 3
+::: story
+Agents look tools up by name. Make a registry that behaves like a dict AND
+can be used as a decorator. `__getitem__` powers `obj[key]`, `__iter__`
+powers `for`, and `__call__` makes an instance callable like a function.
+::: task
+Write `class ToolRegistry`:
+- `register(fn)` stores fn under `fn.__name__` and RETURNS fn (so it works as
+  `@registry.register`). Registering the same name twice raises `ValueError`.
+- `registry["name"]` returns the function; unknown names raise `KeyError`
+  with a message listing the available tools.
+- `"name" in registry`, `len(registry)`, and iterating yields names in
+  registration order.
+- `registry("name", *args, **kwargs)` runs the tool and returns its result.
+::: starter
+class ToolRegistry:
+    def __init__(self):
+        self._tools = {}
+::: solution
+class ToolRegistry:
+    def __init__(self):
+        self._tools = {}
+
+    def register(self, fn):
+        if fn.__name__ in self._tools:
+            raise ValueError(f"tool {fn.__name__!r} already registered")
+        self._tools[fn.__name__] = fn
+        return fn
+
+    def __getitem__(self, name):
+        if name not in self._tools:
+            raise KeyError(f"unknown tool {name!r}; available: {list(self._tools)}")
+        return self._tools[name]
+
+    def __contains__(self, name):
+        return name in self._tools
+
+    def __len__(self):
+        return len(self._tools)
+
+    def __iter__(self):
+        return iter(self._tools)
+
+    def __call__(self, name, *args, **kwargs):
+        return self[name](*args, **kwargs)
+::: hint
+`register` must `return fn`, otherwise the decorated name becomes None.
+::: hint
+`__iter__` can simply `return iter(self._tools)` (dict keys, insertion order).
+::: test decorator registration
+reg = ToolRegistry()
+@reg.register
+def add(a, b):
+    return a + b
+assert add(1, 2) == 3, "register must return the function"
+assert reg["add"] is add and "add" in reg and len(reg) == 1
+::: test call and iteration
+reg = ToolRegistry()
+reg.register(len)
+reg.register(sorted)
+assert list(reg) == ["len", "sorted"]
+assert reg("sorted", [3, 1], reverse=True) == [3, 1]
+::: test errors
+reg = ToolRegistry()
+reg.register(len)
+try:
+    reg.register(len)
+    assert False
+except ValueError:
+    pass
+try:
+    reg["nope"]
+    assert False
+except KeyError as e:
+    assert "len" in str(e), "list available tools in the message"
+
+=== oop-09 | classmethod & staticmethod: factories | 3
+::: story
+- `@classmethod` receives the CLASS as `cls` — perfect for alternative
+  constructors like `ChatOpenAI.from_config(...)`. Using `cls(...)` means
+  subclasses get instances of the subclass.
+- `@staticmethod` is a plain function namespaced in the class.
+::: task
+Write `class ModelConfig(name, temperature=0.0)`:
+- `ModelConfig.from_dict({"name": "x", "temperature": 0.3})` (temperature optional)
+- `ModelConfig.from_string("gpt:0.2")` -> name "gpt", temperature 0.2;
+  `"gpt"` alone -> temperature 0.0
+- `ModelConfig.is_valid_name(name)` staticmethod: True if name is non-empty
+  and only letters, digits, `-` or `.`
+- `__init__` raises `ValueError` for invalid names
+- Both factories must return `cls(...)` so a subclass gets itself back.
+::: starter
+class ModelConfig:
+    def __init__(self, name, temperature=0.0):
+        self.name = name
+        self.temperature = temperature
+::: solution
+import re
+
+class ModelConfig:
+    def __init__(self, name, temperature=0.0):
+        if not self.is_valid_name(name):
+            raise ValueError(f"invalid model name {name!r}")
+        self.name = name
+        self.temperature = temperature
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(data["name"], data.get("temperature", 0.0))
+
+    @classmethod
+    def from_string(cls, spec):
+        name, _, temp = spec.partition(":")
+        return cls(name, float(temp) if temp else 0.0)
+
+    @staticmethod
+    def is_valid_name(name):
+        return bool(re.fullmatch(r"[A-Za-z0-9.\-]+", name or ""))
+::: hint
+`@classmethod def from_dict(cls, data): return cls(...)`
+::: hint
+`re.fullmatch(r"[A-Za-z0-9.\-]+", name)` checks the whole string.
+::: test from_dict
+c = ModelConfig.from_dict({"name": "mini", "temperature": 0.3})
+assert (c.name, c.temperature) == ("mini", 0.3)
+assert ModelConfig.from_dict({"name": "mini"}).temperature == 0.0
+::: test from_string
+c = ModelConfig.from_string("gpt-4.1:0.2")
+assert (c.name, c.temperature) == ("gpt-4.1", 0.2)
+assert ModelConfig.from_string("claude").temperature == 0.0
+::: test validation
+assert ModelConfig.is_valid_name("a-1.b") and not ModelConfig.is_valid_name("bad name") and not ModelConfig.is_valid_name("")
+try:
+    ModelConfig("no spaces!")
+    assert False
+except ValueError:
+    pass
+::: test subclass factories
+class AzureConfig(ModelConfig):
+    pass
+assert type(AzureConfig.from_string("x:1")) is AzureConfig, "use cls(...), not ModelConfig(...)"
+
+=== oop-10 | Composition: assembling a chatbot | 3
+::: story
+"Has-a" beats "is-a": instead of inheriting everything, build objects from
+smaller parts you pass in (dependency injection). Swap the LLM or memory
+without touching the Chatbot — and fake them in tests!
+::: task
+1. `class Memory`: `add(role, content)`, `messages()` -> list of
+   `{"role", "content"}` dicts (a copy), `clear()`.
+2. `class Chatbot(llm, memory=None, system=None)`:
+   - if memory is None, create a new `Memory()` (never share a default!)
+   - `chat(text)`: add the user message to memory, call
+     `llm.generate(messages)` where messages = optional system message
+     `{"role": "system", "content": system}` first + the memory's messages,
+     store the reply as an assistant message, and return the reply.
+The llm can be ANY object with a `generate(messages)` method.
+::: starter
+class Memory:
+    pass
+
+class Chatbot:
+    pass
+::: solution
+class Memory:
+    def __init__(self):
+        self._messages = []
+
+    def add(self, role, content):
+        self._messages.append({"role": role, "content": content})
+
+    def messages(self):
+        return list(self._messages)
+
+    def clear(self):
+        self._messages.clear()
+
+class Chatbot:
+    def __init__(self, llm, memory=None, system=None):
+        self.llm = llm
+        self.memory = memory if memory is not None else Memory()
+        self.system = system
+
+    def chat(self, text):
+        self.memory.add("user", text)
+        messages = self.memory.messages()
+        if self.system:
+            messages = [{"role": "system", "content": self.system}] + messages
+        reply = self.llm.generate(messages)
+        self.memory.add("assistant", reply)
+        return reply
+::: hint
+`self.memory = memory if memory is not None else Memory()`
+::: hint
+Build the list to send: system message (if any) + `self.memory.messages()`.
+::: test chat round trip
+class CountLLM:
+    def __init__(self): self.seen = []
+    def generate(self, messages):
+        self.seen.append(messages)
+        return f"you sent {len(messages)}"
+llm = CountLLM()
+bot = Chatbot(llm, system="be nice")
+assert bot.chat("hi") == "you sent 2"
+assert bot.chat("again") == "you sent 4"
+assert llm.seen[0][0] == {"role": "system", "content": "be nice"}
+assert bot.memory.messages()[-1] == {"role": "assistant", "content": "you sent 4"}
+::: test separate default memories
+class Echo:
+    def generate(self, m): return m[-1]["content"]
+a, b = Chatbot(Echo()), Chatbot(Echo())
+a.chat("secret")
+assert b.memory.messages() == []
+::: test memory returns a copy
+m = Memory(); m.add("user", "x")
+m.messages().append("junk")
+assert len(m.messages()) == 1
+::: test injected memory used
+class Echo:
+    def generate(self, m): return m[-1]["content"]
+shared = Memory()
+Chatbot(Echo(), memory=shared).chat("hey")
+assert len(shared.messages()) == 2
+
+=== oop-11 | Mixins and the MRO | 4
+::: story
+Python supports multiple inheritance. MIXINS are small classes that add one
+capability. The Method Resolution Order (MRO) decides which method runs; with
+cooperative `super()` calls, EVERY class in the chain gets a turn.
+```
+class A:
+    def hi(self): return ["A"]
+class B(A):
+    def hi(self): return ["B"] + super().hi()
+class C(A):
+    def hi(self): return ["C"] + super().hi()
+class D(B, C): pass
+D().hi()        # ['B', 'C', 'A']  (D.__mro__: D, B, C, A, object)
+```
+::: task
+1. `class Agent`: `capabilities()` returns `["base"]`.
+2. `class LoggingMixin`: `log(msg)` appends to `self.logs` (create the list
+   lazily if missing); `capabilities()` returns `["logging"] + super().capabilities()`.
+3. `class CachingMixin`: `cached(key, fn)` returns `self.cache[key]` if
+   present, otherwise calls `fn()`, stores and returns it (create `self.cache`
+   lazily); `capabilities()` returns `["caching"] + super().capabilities()`.
+4. `class SmartAgent(LoggingMixin, CachingMixin, Agent)` — no body needed.
+`SmartAgent().capabilities()` must be `["logging", "caching", "base"]`.
+::: starter
+class Agent:
+    def capabilities(self):
+        return ["base"]
+
+class LoggingMixin:
+    pass
+
+class CachingMixin:
+    pass
+
+class SmartAgent(LoggingMixin, CachingMixin, Agent):
+    pass
+::: solution
+class Agent:
+    def capabilities(self):
+        return ["base"]
+
+class LoggingMixin:
+    def log(self, msg):
+        if not hasattr(self, "logs"):
+            self.logs = []
+        self.logs.append(msg)
+
+    def capabilities(self):
+        return ["logging"] + super().capabilities()
+
+class CachingMixin:
+    def cached(self, key, fn):
+        if not hasattr(self, "cache"):
+            self.cache = {}
+        if key not in self.cache:
+            self.cache[key] = fn()
+        return self.cache[key]
+
+    def capabilities(self):
+        return ["caching"] + super().capabilities()
+
+class SmartAgent(LoggingMixin, CachingMixin, Agent):
+    pass
+::: hint
+`super()` in a mixin means "the NEXT class in the MRO", not "my parent". For SmartAgent that chain is Logging -> Caching -> Agent.
+::: hint
+`hasattr(self, "logs")` lets you create the list on first use.
+::: test mro chain
+assert SmartAgent().capabilities() == ["logging", "caching", "base"]
+assert [c.__name__ for c in SmartAgent.__mro__] == ["SmartAgent", "LoggingMixin", "CachingMixin", "Agent", "object"]
+::: test logging
+a = SmartAgent()
+a.log("x"); a.log("y")
+assert a.logs == ["x", "y"]
+::: test caching
+a = SmartAgent()
+calls = []
+def compute():
+    calls.append(1)
+    return 42
+assert a.cached("k", compute) == 42 and a.cached("k", compute) == 42
+assert len(calls) == 1
+::: test other order
+class Other(CachingMixin, LoggingMixin, Agent):
+    pass
+assert Other().capabilities() == ["caching", "logging", "base"]
+
+=== oop-12 | Observer pattern: LLM callbacks | 4
+::: story
+LangChain's callback system is the Observer pattern: an object emits events,
+any number of handlers react (logging, token counting, streaming to a UI)
+without the emitter knowing what they do.
+::: task
+1. `class CallbackHandler` with no-op methods `on_start(prompt)`,
+   `on_end(output)`, `on_error(error)`.
+2. `class TokenCounter(CallbackHandler)`: counts total words in prompts
+   (`prompt_tokens`) and outputs (`output_tokens`), both starting at 0.
+3. `class EventLog(CallbackHandler)`: keeps `events` list of strings
+   `"start"`, `"end"`, `"error:<ExceptionName>"`.
+4. `class ObservableLLM(fn, callbacks=None)` wraps a function `fn(prompt) -> str`.
+   `invoke(prompt)` calls `on_start` on every handler, runs fn, then `on_end`
+   — or on exception calls `on_error` on every handler and re-raises.
+   `add_callback(handler)` adds one more.
+::: starter
+class CallbackHandler:
+    pass
+
+class TokenCounter(CallbackHandler):
+    pass
+
+class EventLog(CallbackHandler):
+    pass
+
+class ObservableLLM:
+    def __init__(self, fn, callbacks=None):
+        pass
+::: solution
+class CallbackHandler:
+    def on_start(self, prompt):
+        pass
+
+    def on_end(self, output):
+        pass
+
+    def on_error(self, error):
+        pass
+
+class TokenCounter(CallbackHandler):
+    def __init__(self):
+        self.prompt_tokens = 0
+        self.output_tokens = 0
+
+    def on_start(self, prompt):
+        self.prompt_tokens += len(prompt.split())
+
+    def on_end(self, output):
+        self.output_tokens += len(output.split())
+
+class EventLog(CallbackHandler):
+    def __init__(self):
+        self.events = []
+
+    def on_start(self, prompt):
+        self.events.append("start")
+
+    def on_end(self, output):
+        self.events.append("end")
+
+    def on_error(self, error):
+        self.events.append(f"error:{type(error).__name__}")
+
+class ObservableLLM:
+    def __init__(self, fn, callbacks=None):
+        self.fn = fn
+        self.callbacks = list(callbacks or [])
+
+    def add_callback(self, handler):
+        self.callbacks.append(handler)
+
+    def invoke(self, prompt):
+        for cb in self.callbacks:
+            cb.on_start(prompt)
+        try:
+            output = self.fn(prompt)
+        except Exception as exc:
+            for cb in self.callbacks:
+                cb.on_error(exc)
+            raise
+        for cb in self.callbacks:
+            cb.on_end(output)
+        return output
+::: hint
+Handlers only override the events they care about; the base class provides no-op defaults.
+::: hint
+Wrap only `self.fn(prompt)` in try/except, notify handlers, then bare `raise` re-raises.
+::: test token counter
+tc = TokenCounter()
+llm = ObservableLLM(lambda p: "one two three", [tc])
+llm.invoke("hello world")
+llm.invoke("x")
+assert (tc.prompt_tokens, tc.output_tokens) == (3, 6)
+::: test multiple handlers and add_callback
+log = EventLog()
+llm = ObservableLLM(str.upper)
+llm.add_callback(log)
+assert llm.invoke("hi") == "HI"
+assert log.events == ["start", "end"]
+::: test errors notify and re-raise
+log = EventLog()
+def broken(p):
+    raise TimeoutError("slow")
+llm = ObservableLLM(broken, [log, TokenCounter()])
+try:
+    llm.invoke("x")
+    assert False, "should re-raise"
+except TimeoutError:
+    pass
+assert log.events == ["start", "error:TimeoutError"]
+::: test base handler is a no-op
+h = CallbackHandler()
+h.on_start("x"); h.on_end("y"); h.on_error(ValueError())

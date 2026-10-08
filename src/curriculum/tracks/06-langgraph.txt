@@ -1,0 +1,860 @@
+=== lg-01 | State and nodes | 2
+::: story
+LangGraph models an agent as a GRAPH:
+- STATE: a dict (usually a TypedDict) shared by every step
+- NODES: plain functions `node(state) -> dict` that return ONLY the keys they
+  want to change (a partial update). They must not mutate the state.
+- EDGES: which node runs next
+Let's start with state and nodes.
+::: task
+1. `class State(TypedDict)` with keys `question: str`, `answer: str`, `log: list`.
+2. Node `clean(state)`: returns `{"question": <stripped & lowercased>, "log": <log + ["clean"]>}`
+3. Node `respond(state)`: returns `{"answer": "You asked: <question>", "log": <log + ["respond"]>}`
+Nodes must return NEW lists (`state["log"] + [...]`), never `.append` to the state.
+::: starter
+from typing import TypedDict
+
+class State(TypedDict):
+    pass
+
+def clean(state):
+    pass
+
+def respond(state):
+    pass
+::: solution
+from typing import TypedDict
+
+class State(TypedDict):
+    question: str
+    answer: str
+    log: list
+
+def clean(state):
+    return {"question": state["question"].strip().lower(), "log": state["log"] + ["clean"]}
+
+def respond(state):
+    return {"answer": f"You asked: {state['question']}", "log": state["log"] + ["respond"]}
+::: hint
+A partial update only contains the keys that change — `clean` doesn't return "answer".
+::: hint
+`state["log"] + ["clean"]` builds a new list; `.append` would mutate the input.
+::: test state schema
+from typing import get_type_hints
+assert get_type_hints(State) == {"question": str, "answer": str, "log": list}
+::: test clean returns partial update
+s = {"question": "  What Is RAG? ", "answer": "", "log": []}
+assert clean(s) == {"question": "what is rag?", "log": ["clean"]}
+assert s["log"] == [] and s["question"] == "  What Is RAG? ", "nodes must not mutate state"
+::: test respond
+s = {"question": "what is rag?", "answer": "", "log": ["clean"]}
+assert respond(s) == {"answer": "You asked: what is rag?", "log": ["clean", "respond"]}
+
+=== lg-02 | Running nodes: merging updates | 2
+::: story
+The graph engine — not the nodes — owns the state. After each node it MERGES
+the partial update into the current state. Default rule: a returned key
+overwrites the old value.
+::: task
+1. `merge(state, update)` -> NEW dict = state with update's keys overwritten.
+   `update` may be `None` (meaning "no change").
+2. `run_pipeline(nodes, state)` -> run each node function in order, merging
+   after each one; return the final state. Don't mutate the input state.
+   If a node returns something that isn't a dict or None, raise `TypeError`
+   with the node's `__name__` in the message.
+::: starter
+def merge(state, update):
+    pass
+
+def run_pipeline(nodes, state):
+    pass
+::: solution
+def merge(state, update):
+    if update is None:
+        return dict(state)
+    return {**state, **update}
+
+def run_pipeline(nodes, state):
+    current = dict(state)
+    for node in nodes:
+        update = node(current)
+        if update is not None and not isinstance(update, dict):
+            raise TypeError(f"node {node.__name__} returned {type(update).__name__}, expected dict")
+        current = merge(current, update)
+    return current
+::: hint
+`{**state, **update}` creates a merged copy.
+::: hint
+Check the return value BEFORE merging: `if update is not None and not isinstance(update, dict)`.
+::: test merge
+s = {"a": 1, "b": 2}
+assert merge(s, {"b": 3, "c": 4}) == {"a": 1, "b": 3, "c": 4}
+assert s == {"a": 1, "b": 2} and merge(s, None) == s
+::: test pipeline
+def inc(state): return {"n": state["n"] + 1}
+def double(state): return {"n": state["n"] * 2, "done": True}
+def noop(state): return None
+start = {"n": 1}
+assert run_pipeline([inc, double, noop], start) == {"n": 4, "done": True}
+assert start == {"n": 1}
+::: test bad node
+def broken(state): return "oops"
+try:
+    run_pipeline([broken], {})
+    assert False
+except TypeError as e:
+    assert "broken" in str(e)
+
+=== lg-03 | Build a StateGraph | 3
+::: story
+Time to build the engine:
+```
+graph = SimpleGraph()
+graph.add_node("clean", clean)
+graph.add_edge(START, "clean")
+graph.add_edge("clean", END)
+app = graph.compile()
+app.invoke({"question": "Hi"})
+```
+`START` and `END` are special node names for entry and exit.
+::: task
+Write `class SimpleGraph` (one outgoing edge per node, for now):
+- `add_node(name, fn)` — duplicate names raise `ValueError`
+- `add_edge(src, dst)` — a second edge from the same src raises `ValueError`
+- `compile()` — raise `ValueError` if there's no edge from START or an edge
+  mentions an unknown node; otherwise return an object with `invoke`
+  (returning `self` is fine)
+- `invoke(state, max_steps=20)` — start at START's target, run nodes and
+  merge updates (overwrite) until END; return the final state (a new dict).
+  A node with no outgoing edge raises `ValueError`; more than max_steps node
+  runs raises `RecursionError`.
+::: starter
+START = "__start__"
+END = "__end__"
+
+class SimpleGraph:
+    def __init__(self):
+        self.nodes = {}
+        self.edges = {}
+::: solution
+START = "__start__"
+END = "__end__"
+
+class SimpleGraph:
+    def __init__(self):
+        self.nodes = {}
+        self.edges = {}
+
+    def add_node(self, name, fn):
+        if name in self.nodes:
+            raise ValueError(f"duplicate node {name!r}")
+        self.nodes[name] = fn
+
+    def add_edge(self, src, dst):
+        if src in self.edges:
+            raise ValueError(f"{src!r} already has an outgoing edge")
+        self.edges[src] = dst
+
+    def compile(self):
+        if START not in self.edges:
+            raise ValueError("no entry point: add_edge(START, ...)")
+        for src, dst in self.edges.items():
+            for name in (src, dst):
+                if name not in (START, END) and name not in self.nodes:
+                    raise ValueError(f"unknown node {name!r}")
+        return self
+
+    def invoke(self, state, max_steps=20):
+        state = dict(state)
+        current = self.edges[START]
+        steps = 0
+        while current != END:
+            steps += 1
+            if steps > max_steps:
+                raise RecursionError("too many steps")
+            update = self.nodes[current](state)
+            if update:
+                state = {**state, **update}
+            if current not in self.edges:
+                raise ValueError(f"node {current!r} has no outgoing edge")
+            current = self.edges[current]
+        return state
+::: hint
+`self.edges` can map src -> dst directly since each node has one edge.
+::: hint
+In `invoke`, loop `while current != END:` — run the node, merge, then move to `self.edges[current]`.
+::: test linear graph
+g = SimpleGraph()
+g.add_node("a", lambda s: {"path": s["path"] + "a"})
+g.add_node("b", lambda s: {"path": s["path"] + "b"})
+g.add_edge(START, "a"); g.add_edge("a", "b"); g.add_edge("b", END)
+app = g.compile()
+assert app.invoke({"path": ""}) == {"path": "ab"}
+::: test validation
+g = SimpleGraph()
+g.add_node("a", lambda s: s)
+try:
+    g.add_node("a", lambda s: s); assert False
+except ValueError: pass
+try:
+    g.compile(); assert False, "no entry point"
+except ValueError: pass
+g.add_edge(START, "a"); g.add_edge("a", "ghost")
+try:
+    g.compile(); assert False, "unknown node"
+except ValueError: pass
+::: test dead end and loops
+g = SimpleGraph()
+g.add_node("a", lambda s: None)
+g.add_edge(START, "a")
+try:
+    g.compile().invoke({}); assert False, "dead end"
+except ValueError: pass
+g2 = SimpleGraph()
+g2.add_node("x", lambda s: {"n": s.get("n", 0) + 1})
+g2.add_edge(START, "x"); g2.add_edge("x", "x")
+try:
+    g2.compile().invoke({}, max_steps=5); assert False
+except RecursionError: pass
+::: realworld
+    from langgraph.graph import StateGraph, START, END
+    g = StateGraph(State); g.add_node("clean", clean)
+    g.add_edge(START, "clean"); g.add_edge("clean", END)
+    app = g.compile(); app.invoke({"question": "Hi"})
+
+=== lg-04 | Reducers: how updates combine | 3
+::: story
+Overwriting is wrong for lists of messages — two nodes adding messages would
+clobber each other. LangGraph lets each key declare a REDUCER in its type:
+```
+from typing import Annotated
+import operator
+class State(TypedDict):
+    messages: Annotated[list, operator.add]   # new = old + update
+    mood: str                                 # plain key: overwrite
+```
+The engine reads the reducer from the type hints.
+`get_type_hints(S, include_extras=True)` keeps Annotated info, and
+`hint.__metadata__` holds the extra values.
+::: task
+1. `get_reducers(schema)` -> dict key -> reducer function for every key typed
+   `Annotated[..., fn]` (use the last callable in the metadata).
+2. `apply_update(state, update, reducers)` -> NEW state; reducer keys present
+   in the old state become `reducer(old, new)`, everything else overwrites.
+3. `add_messages(left, right)` — a smarter reducer: `right` is a message dict
+   or a list of them; a message whose `"id"` matches an existing message
+   REPLACES it in place, others are appended. Returns a new list.
+4. `class ChatState(TypedDict)`: `messages: Annotated[list, add_messages]`,
+   `turns: Annotated[int, operator.add]`, `mood: str`.
+::: starter
+import operator
+from typing import Annotated, TypedDict, get_origin, get_type_hints
+
+def get_reducers(schema):
+    pass
+
+def apply_update(state, update, reducers):
+    pass
+
+def add_messages(left, right):
+    pass
+::: solution
+import operator
+from typing import Annotated, TypedDict, get_origin, get_type_hints
+
+def get_reducers(schema):
+    reducers = {}
+    for key, hint in get_type_hints(schema, include_extras=True).items():
+        if get_origin(hint) is Annotated:
+            fns = [m for m in hint.__metadata__ if callable(m)]
+            if fns:
+                reducers[key] = fns[-1]
+    return reducers
+
+def apply_update(state, update, reducers):
+    new = dict(state)
+    for key, value in update.items():
+        if key in reducers and key in new:
+            new[key] = reducers[key](new[key], value)
+        else:
+            new[key] = value
+    return new
+
+def add_messages(left, right):
+    if isinstance(right, dict):
+        right = [right]
+    merged = list(left)
+    for msg in right:
+        for i, old in enumerate(merged):
+            if "id" in msg and old.get("id") == msg["id"]:
+                merged[i] = msg
+                break
+        else:
+            merged.append(msg)
+    return merged
+
+class ChatState(TypedDict):
+    messages: Annotated[list, add_messages]
+    turns: Annotated[int, operator.add]
+    mood: str
+::: hint
+`get_origin(hint) is Annotated` detects annotated keys.
+::: hint
+A `for ... else:` loop's else-branch runs only if the loop didn't `break` — perfect for "replace or append".
+::: test get reducers
+class S(TypedDict):
+    msgs: Annotated[list, operator.add]
+    name: str
+assert get_reducers(S) == {"msgs": operator.add}
+assert set(get_reducers(ChatState)) == {"messages", "turns"}
+::: test apply update
+r = {"msgs": operator.add}
+s = {"msgs": [1], "name": "a"}
+assert apply_update(s, {"msgs": [2], "name": "b"}, r) == {"msgs": [1, 2], "name": "b"}
+assert s == {"msgs": [1], "name": "a"}
+assert apply_update({}, {"msgs": [9]}, r) == {"msgs": [9]}
+::: test add_messages
+a = {"id": "1", "content": "hi"}
+b = {"id": "2", "content": "draft"}
+out = add_messages([a, b], [{"id": "2", "content": "final"}, {"content": "new"}])
+assert out == [a, {"id": "2", "content": "final"}, {"content": "new"}]
+assert add_messages([], {"content": "x"}) == [{"content": "x"}]
+::: test full state
+r = get_reducers(ChatState)
+s = {"messages": [], "turns": 0, "mood": "ok"}
+s = apply_update(s, {"messages": [{"content": "hi"}], "turns": 1, "mood": "happy"}, r)
+s = apply_update(s, {"messages": {"content": "yo"}, "turns": 1}, r)
+assert s == {"messages": [{"content": "hi"}, {"content": "yo"}], "turns": 2, "mood": "happy"}
+
+=== lg-05 | Conditional edges: a router | 3
+::: story
+From now on the `mini_graph` prelude gives you a full LangGraph-compatible
+`StateGraph` (type `setup` to read it). The new idea here: CONDITIONAL edges.
+```
+graph.add_conditional_edges("classify", route_fn, {"math": "math_agent", "chat": "chat_agent"})
+```
+After "classify" runs, `route_fn(state)` returns a key; the map turns it into
+the next node.
+::: setup fake_llm mini_graph
+::: task
+Write `build_router(llm)` returning a compiled graph over
+`class RouterState(TypedDict)`: `question: str`, `route: str`, `answer: str`.
+Nodes:
+- `classify`: `llm.invoke("Classify as math or chat: <question>")`, stripped
+  and lowercased. Anything other than "math"/"chat" becomes "chat". Sets `route`.
+- `math_agent`: sets `answer` to `"MATH: <question>"`
+- `chat_agent`: sets `answer` to `llm.invoke(question)`
+Wire START -> classify -> (conditional on route) -> agent -> END.
+::: starter
+from typing import TypedDict
+
+class RouterState(TypedDict):
+    question: str
+    route: str
+    answer: str
+
+def build_router(llm):
+    graph = StateGraph(RouterState)
+    # add nodes and edges here
+    return graph.compile()
+::: solution
+from typing import TypedDict
+
+class RouterState(TypedDict):
+    question: str
+    route: str
+    answer: str
+
+def build_router(llm):
+    def classify(state):
+        route = llm.invoke(f"Classify as math or chat: {state['question']}").strip().lower()
+        return {"route": route if route in ("math", "chat") else "chat"}
+
+    def math_agent(state):
+        return {"answer": f"MATH: {state['question']}"}
+
+    def chat_agent(state):
+        return {"answer": llm.invoke(state["question"])}
+
+    graph = StateGraph(RouterState)
+    graph.add_node("classify", classify)
+    graph.add_node("math_agent", math_agent)
+    graph.add_node("chat_agent", chat_agent)
+    graph.add_edge(START, "classify")
+    graph.add_conditional_edges("classify", lambda s: s["route"], {"math": "math_agent", "chat": "chat_agent"})
+    graph.add_edge("math_agent", END)
+    graph.add_edge("chat_agent", END)
+    return graph.compile()
+::: hint
+Define the node functions INSIDE `build_router` so they can use `llm` (a closure!).
+::: hint
+The router can be `lambda s: s["route"]`.
+::: test math route
+llm = FakeLLM(rules={"classify": " MATH "})
+app = build_router(llm)
+out = app.invoke({"question": "2 + 2"})
+assert out["route"] == "math" and out["answer"] == "MATH: 2 + 2"
+::: test chat route
+llm = FakeLLM(rules={"classify": "chat", "hello": "Hi friend"})
+out = build_router(llm).invoke({"question": "hello"})
+assert out["answer"] == "Hi friend"
+::: test unknown route falls back and only one agent runs
+llm = FakeLLM(rules={"classify": "poetry"}, default="fallback")
+app = build_router(llm)
+ran = [list(e)[0] for e in app.stream({"question": "?"})]
+assert ran == ["classify", "chat_agent"], ran
+
+=== lg-06 | Loops: write, review, revise | 3
+::: story
+Graphs can loop — that's what makes agents iterative. A conditional edge that
+points BACK to an earlier node creates a cycle. Every loop needs a guard
+(max iterations) or it may never end.
+::: setup mini_graph
+def score_draft(draft):
+    """Toy critic: each 'More detail.' improves the score."""
+    return 2 + 3 * draft.count("More detail.")
+::: task
+Write `build_refiner(threshold=8, max_revisions=5)` returning a compiled
+graph over `RefineState` (`topic`, `draft`, `revisions`, `score`):
+- `write`: if there's no draft yet (missing or empty), draft =
+  `"Essay on <topic>."`; otherwise append `" More detail."`. Increments
+  `revisions` (missing counts as 0).
+- `review`: sets `score = score_draft(draft)` (provided)
+- after review: END if `score >= threshold` or `revisions >= max_revisions`,
+  otherwise back to `write`.
+::: starter
+from typing import TypedDict
+
+class RefineState(TypedDict):
+    topic: str
+    draft: str
+    revisions: int
+    score: int
+
+def build_refiner(threshold=8, max_revisions=5):
+    pass
+::: solution
+from typing import TypedDict
+
+class RefineState(TypedDict):
+    topic: str
+    draft: str
+    revisions: int
+    score: int
+
+def build_refiner(threshold=8, max_revisions=5):
+    def write(state):
+        draft = state.get("draft") or ""
+        draft = draft + " More detail." if draft else f"Essay on {state['topic']}."
+        return {"draft": draft, "revisions": state.get("revisions", 0) + 1}
+
+    def review(state):
+        return {"score": score_draft(state["draft"])}
+
+    def should_continue(state):
+        if state["score"] >= threshold or state["revisions"] >= max_revisions:
+            return "done"
+        return "revise"
+
+    graph = StateGraph(RefineState)
+    graph.add_node("write", write)
+    graph.add_node("review", review)
+    graph.add_edge(START, "write")
+    graph.add_edge("write", "review")
+    graph.add_conditional_edges("review", should_continue, {"revise": "write", "done": END})
+    return graph.compile()
+::: hint
+`state.get("revisions", 0) + 1` handles the first run.
+::: hint
+Map the router's answers: `{"revise": "write", "done": END}`.
+::: test reaches threshold
+out = build_refiner().invoke({"topic": "agents"})
+assert out["draft"] == "Essay on agents. More detail. More detail."
+assert out["revisions"] == 3 and out["score"] == 8
+::: test guard stops loop
+out = build_refiner(threshold=100, max_revisions=2).invoke({"topic": "x"})
+assert out["revisions"] == 2
+::: test execution order
+app = build_refiner(threshold=5)
+assert [list(e)[0] for e in app.stream({"topic": "t"})] == ["write", "review", "write", "review"]
+
+=== lg-07 | The ReAct agent graph | 4
+::: story
+The classic agent graph has two nodes and a loop:
+```
+START -> agent --(tool_calls?)--> tools -> agent ... --(no tool calls)--> END
+```
+State is a list of messages with an `operator.add` reducer, so each node just
+returns the NEW messages it produced. You built the loop by hand in lc-08;
+now express it as a graph.
+::: setup fake_llm mini_lc mini_graph
+::: task
+Write `build_react_agent(llm, tools)` returning a compiled graph over
+`AgentState` (`messages: Annotated[list, operator.add]`):
+- `agent` node: `reply = llm.invoke(messages)`; return one assistant message
+  `{"role": "assistant", "content": ..., "tool_calls": [...]}` (str replies
+  have content=reply and tool_calls=[]; dict replies keep their content /
+  tool_calls, defaulting to "" / []).
+- `tools` node: for each tool call in the LAST message, run the tool and
+  return `{"role": "tool", "tool_call_id": id, "content": str(result)}`
+  messages (unknown tool -> `"Error: unknown tool <name>"`).
+- router after agent: `"tools"` if the last message has tool calls, else END.
+- `tools` always goes back to `agent`.
+::: starter
+import operator
+from typing import Annotated, TypedDict
+
+class AgentState(TypedDict):
+    messages: Annotated[list, operator.add]
+
+def build_react_agent(llm, tools):
+    by_name = {t.name: t for t in tools}
+    pass
+::: solution
+import operator
+from typing import Annotated, TypedDict
+
+class AgentState(TypedDict):
+    messages: Annotated[list, operator.add]
+
+def build_react_agent(llm, tools):
+    by_name = {t.name: t for t in tools}
+
+    def agent(state):
+        reply = llm.invoke(state["messages"])
+        if isinstance(reply, str):
+            reply = {"content": reply}
+        msg = {"role": "assistant", "content": reply.get("content", ""), "tool_calls": reply.get("tool_calls", [])}
+        return {"messages": [msg]}
+
+    def run_tools(state):
+        out = []
+        for call in state["messages"][-1]["tool_calls"]:
+            t = by_name.get(call["name"])
+            result = t.invoke(call["args"]) if t else f"Error: unknown tool {call['name']}"
+            out.append({"role": "tool", "tool_call_id": call["id"], "content": str(result)})
+        return {"messages": out}
+
+    def should_continue(state):
+        return "tools" if state["messages"][-1].get("tool_calls") else END
+
+    graph = StateGraph(AgentState)
+    graph.add_node("agent", agent)
+    graph.add_node("tools", run_tools)
+    graph.add_edge(START, "agent")
+    graph.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+    graph.add_edge("tools", "agent")
+    return graph.compile()
+::: hint
+Nodes return `{"messages": [new_msg]}` — the reducer appends it to the history.
+::: hint
+The path map can include END itself: `{"tools": "tools", END: END}`.
+::: test answers with tools
+@tool
+def multiply(a: int, b: int) -> int:
+    """Multiply."""
+    return a * b
+llm = FakeLLM(responses=[
+    {"content": "let me compute", "tool_calls": [{"id": "t1", "name": "multiply", "args": {"a": 6, "b": 7}}]},
+    "6 x 7 = 42",
+])
+app = build_react_agent(llm, [multiply])
+out = app.invoke({"messages": [{"role": "user", "content": "6*7?"}]})
+msgs = out["messages"]
+assert [m["role"] for m in msgs] == ["user", "assistant", "tool", "assistant"]
+assert msgs[2] == {"role": "tool", "tool_call_id": "t1", "content": "42"}
+assert msgs[-1]["content"] == "6 x 7 = 42" and msgs[-1]["tool_calls"] == []
+::: test no tools needed
+app = build_react_agent(FakeLLM(default="hello!"), [])
+out = app.invoke({"messages": [{"role": "user", "content": "hi"}]})
+assert len(out["messages"]) == 2 and out["messages"][1]["content"] == "hello!"
+::: test graph shape
+llm = FakeLLM(responses=[{"tool_calls": [{"id": "1", "name": "x", "args": {}}]}, "done"])
+app = build_react_agent(llm, [])
+order = [list(e)[0] for e in app.stream({"messages": [{"role": "user", "content": "?"}]})]
+assert order == ["agent", "tools", "agent"]
+::: realworld
+    from langgraph.prebuilt import create_react_agent
+    app = create_react_agent(llm, tools=[multiply])
+
+=== lg-08 | Checkpointing: memory across turns | 4
+::: story
+A checkpointer saves the graph's state after every run under a `thread_id`,
+so the next run continues the same conversation — and lets you "time travel"
+back to earlier versions. `chat_app` (a compiled graph that answers based on
+how many user messages it has seen) is provided.
+::: setup mini_graph
+import operator
+from typing import Annotated, TypedDict
+
+class ChatState(TypedDict):
+    messages: Annotated[list, operator.add]
+
+def _bot(state):
+    n = sum(1 for m in state["messages"] if m["role"] == "user")
+    return {"messages": [{"role": "assistant", "content": f"reply #{n}"}]}
+
+_g = StateGraph(ChatState)
+_g.add_node("bot", _bot)
+_g.add_edge(START, "bot")
+_g.add_edge("bot", END)
+chat_app = _g.compile()
+::: task
+1. `class Checkpointer`:
+   - `save(thread_id, state)` stores a DEEP copy as a new version
+   - `load(thread_id)` -> deep copy of the latest version, or `None`
+   - `history(thread_id)` -> list of all versions (oldest first; `[]` if none)
+   - `rewind(thread_id, version)` -> keep only versions `0..version`, return
+     a deep copy of that version
+2. `run_turn(app, checkpointer, thread_id, text)`: load the thread's state
+   (or `{"messages": []}`), invoke `app` with
+   `{"messages": old_messages + [{"role": "user", "content": text}]}`,
+   save the result, and return the last message's content.
+   (`chat_app` has no checkpointer of its own, so each invoke starts empty —
+   YOUR checkpointer is what gives it memory.)
+::: starter
+import copy
+
+class Checkpointer:
+    def __init__(self):
+        self._threads = {}
+
+def run_turn(app, checkpointer, thread_id, text):
+    pass
+::: solution
+import copy
+
+class Checkpointer:
+    def __init__(self):
+        self._threads = {}
+
+    def save(self, thread_id, state):
+        self._threads.setdefault(thread_id, []).append(copy.deepcopy(state))
+
+    def load(self, thread_id):
+        versions = self._threads.get(thread_id)
+        return copy.deepcopy(versions[-1]) if versions else None
+
+    def history(self, thread_id):
+        return copy.deepcopy(self._threads.get(thread_id, []))
+
+    def rewind(self, thread_id, version):
+        versions = self._threads[thread_id]
+        del versions[version + 1:]
+        return copy.deepcopy(versions[version])
+
+def run_turn(app, checkpointer, thread_id, text):
+    state = checkpointer.load(thread_id) or {"messages": []}
+    new_msg = {"role": "user", "content": text}
+    result = app.invoke({"messages": state["messages"] + [new_msg]})
+    checkpointer.save(thread_id, result)
+    return result["messages"][-1]["content"]
+::: hint
+`copy.deepcopy` protects saved versions from later mutation (nested lists!).
+::: hint
+`del versions[version + 1:]` truncates a list in place.
+::: test conversation continues
+cp = Checkpointer()
+assert run_turn(chat_app, cp, "t1", "hi") == "reply #1"
+assert run_turn(chat_app, cp, "t1", "again") == "reply #2"
+assert len(cp.load("t1")["messages"]) == 4
+::: test threads isolated
+cp = Checkpointer()
+run_turn(chat_app, cp, "a", "x"); run_turn(chat_app, cp, "a", "y")
+assert run_turn(chat_app, cp, "b", "z") == "reply #1"
+assert cp.load("nobody") is None and cp.history("nobody") == []
+::: test deep copies
+cp = Checkpointer()
+s = {"messages": [{"role": "user", "content": "x"}]}
+cp.save("t", s)
+s["messages"].append("junk")
+cp.load("t")["messages"].append("junk2")
+assert cp.load("t") == {"messages": [{"role": "user", "content": "x"}]}
+::: test time travel
+cp = Checkpointer()
+for t in ["one", "two", "three"]:
+    run_turn(chat_app, cp, "t", t)
+assert len(cp.history("t")) == 3
+old = cp.rewind("t", 0)
+assert len(old["messages"]) == 2 and len(cp.history("t")) == 1
+assert run_turn(chat_app, cp, "t", "branch") == "reply #2"
+::: realworld
+    from langgraph.checkpoint.memory import MemorySaver
+    app = graph.compile(checkpointer=MemorySaver())
+    app.invoke({"messages": [...]}, {"configurable": {"thread_id": "user-42"}})
+
+=== lg-09 | Human-in-the-loop approval | 4
+::: story
+Some actions (sending email, deleting data, spending money) need a human OK.
+LangGraph can PAUSE before a node and resume later:
+```
+app = graph.compile(checkpointer=MemorySaver(), interrupt_before=["execute"])
+config = {"configurable": {"thread_id": "1"}}
+app.invoke({"target": "db"}, config)        # stops before "execute"
+app.get_state(config).next                  # ('execute',)
+app.update_state(config, {"approved": True})
+app.invoke(None, config)                    # None = resume where it paused
+```
+The mini_graph prelude supports all of these.
+::: setup mini_graph
+::: task
+1. `build_app()` -> compiled graph over `ActionState` (`target`, `plan`,
+   `approved`, `result`) with a MemorySaver and an interrupt before `execute`:
+   - `plan`: sets `plan = "delete <target>"`
+   - `execute`: `result = "done: <plan>"` if `approved` is truthy, else `"cancelled"`
+   - START -> plan -> execute -> END
+2. `start(app, thread_id, target)` -> runs until the pause and returns the
+   tuple of next nodes (`app.get_state(config).next`).
+3. `decide(app, thread_id, approved)` -> records the decision with
+   `update_state`, resumes, and returns the final `result`.
+::: starter
+from typing import TypedDict
+
+class ActionState(TypedDict):
+    target: str
+    plan: str
+    approved: bool
+    result: str
+
+def build_app():
+    pass
+
+def start(app, thread_id, target):
+    pass
+
+def decide(app, thread_id, approved):
+    pass
+::: solution
+from typing import TypedDict
+
+class ActionState(TypedDict):
+    target: str
+    plan: str
+    approved: bool
+    result: str
+
+def plan(state):
+    return {"plan": f"delete {state['target']}"}
+
+def execute(state):
+    if state.get("approved"):
+        return {"result": f"done: {state['plan']}"}
+    return {"result": "cancelled"}
+
+def build_app():
+    graph = StateGraph(ActionState)
+    graph.add_node("plan", plan)
+    graph.add_node("execute", execute)
+    graph.add_edge(START, "plan")
+    graph.add_edge("plan", "execute")
+    graph.add_edge("execute", END)
+    return graph.compile(checkpointer=MemorySaver(), interrupt_before=["execute"])
+
+def _config(thread_id):
+    return {"configurable": {"thread_id": thread_id}}
+
+def start(app, thread_id, target):
+    app.invoke({"target": target}, _config(thread_id))
+    return app.get_state(_config(thread_id)).next
+
+def decide(app, thread_id, approved):
+    config = _config(thread_id)
+    app.update_state(config, {"approved": approved})
+    return app.invoke(None, config)["result"]
+::: hint
+Every call for the same conversation must use the same config dict shape: `{"configurable": {"thread_id": thread_id}}`.
+::: hint
+Resume by passing `None` as the input: `app.invoke(None, config)`.
+::: test pauses before execute
+app = build_app()
+assert start(app, "t1", "prod-db") == ("execute",)
+state = app.get_state({"configurable": {"thread_id": "t1"}}).values
+assert state["plan"] == "delete prod-db" and "result" not in state
+::: test approve
+app = build_app()
+start(app, "t1", "logs")
+assert decide(app, "t1", True) == "done: delete logs"
+assert app.get_state({"configurable": {"thread_id": "t1"}}).next == ()
+::: test reject and threads independent
+app = build_app()
+start(app, "a", "x"); start(app, "b", "y")
+assert decide(app, "b", False) == "cancelled"
+assert decide(app, "a", True) == "done: delete x"
+
+=== lg-10 | Streaming graph events | 3
+::: story
+Users hate staring at a spinner. `app.stream(input)` yields one event per node
+as it finishes: `{"node_name": update_dict}` — perfect for progress UIs and
+debugging. `demo_app` (retrieve -> grade -> generate) is provided.
+::: setup mini_graph
+from typing import TypedDict
+
+class DemoState(TypedDict):
+    question: str
+    docs: list
+    relevant: list
+    answer: str
+
+def retrieve(s):
+    return {"docs": ["doc about " + s["question"], "unrelated doc"]}
+
+def grade(s):
+    return {"relevant": [d for d in s["docs"] if s["question"] in d]}
+
+def generate(s):
+    return {"answer": f"Based on {len(s['relevant'])} doc(s): yes"}
+
+_g = StateGraph(DemoState)
+for _name, _fn in [("retrieve", retrieve), ("grade", grade), ("generate", generate)]:
+    _g.add_node(_name, _fn)
+_g.add_edge(START, "retrieve")
+_g.add_edge("retrieve", "grade")
+_g.add_edge("grade", "generate")
+_g.add_edge("generate", END)
+demo_app = _g.compile()
+::: task
+1. `trace(app, input)` -> list of node names in the order they ran.
+2. `progress(app, input)` -> a GENERATOR yielding lines like
+   `"[1] retrieve: docs"` (step number from 1, node name, the updated keys
+   sorted and comma-separated).
+3. `final_state(app, input)` -> rebuild the final state yourself from the
+   stream: start from a copy of input and merge every update (overwrite).
+::: starter
+def trace(app, input):
+    pass
+
+def progress(app, input):
+    pass
+
+def final_state(app, input):
+    pass
+::: solution
+def trace(app, input):
+    return [name for event in app.stream(input) for name in event]
+
+def progress(app, input):
+    for i, event in enumerate(app.stream(input), start=1):
+        for name, update in event.items():
+            yield f"[{i}] {name}: {', '.join(sorted(update))}"
+
+def final_state(app, input):
+    state = dict(input)
+    for event in app.stream(input):
+        for update in event.values():
+            state.update(update)
+    return state
+::: hint
+Each event is a one-item dict — `for name, update in event.items()`.
+::: hint
+`enumerate(app.stream(input), start=1)` numbers the steps.
+::: test trace
+assert trace(demo_app, {"question": "cats"}) == ["retrieve", "grade", "generate"]
+::: test progress lines
+import types
+p = progress(demo_app, {"question": "cats"})
+assert isinstance(p, types.GeneratorType), "use yield"
+assert list(p) == ["[1] retrieve: docs", "[2] grade: relevant", "[3] generate: answer"]
+::: test final state matches invoke
+inp = {"question": "dogs"}
+assert final_state(demo_app, inp) == demo_app.invoke(inp)
+assert inp == {"question": "dogs"}
